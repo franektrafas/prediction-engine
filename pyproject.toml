@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "football-ai"
+version = "0.1.0"
+description = "Modular AI system for predicting national team football matches."
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [
+  {name = "Codex"}
+]
+dependencies = [
+  "catboost>=1.2.7",
+  "fastapi>=0.116.0",
+  "httpx>=0.28.1",
+  "joblib>=1.5.1",
+  "lightgbm>=4.6.0",
+  "matplotlib>=3.10.3",
+  "numpy>=2.3.1",
+  "optuna>=4.4.0",
+  "pandas>=2.3.0",
+  "plotly>=6.2.0",
+  "polars>=1.31.0",
+  "psycopg[binary]>=3.2.9",
+  "pydantic>=2.11.7",
+  "python-dotenv>=1.1.1",
+  "requests>=2.32.4",
+  "scikit-learn>=1.7.0",
+  "scipy>=1.16.0",
+  "shap>=0.48.0",
+  "sqlalchemy>=2.0.41",
+  "uvicorn>=0.35.0",
+  "xgboost>=3.0.2"
+]
+
+[project.optional-dependencies]
+dev = [
+  "jupyter>=1.1.1",
+  "pytest>=8.4.1",
+  "pytest-cov>=6.2.1",
+  "ruff>=0.12.2"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["football_ai*"]
+
+[tool.pytest.ini_options]
+testpaths = ["football_ai/tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N", "D"]
+ignore = ["D203", "D213"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
