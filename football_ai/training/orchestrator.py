@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 
 from football_ai.evaluation.metrics import evaluate_predictions
 from football_ai.evaluation.plots import (
@@ -155,6 +156,21 @@ def _persist_evaluation_artifacts(
         return
 
 
+def _normalize_predictions(
+    predictions: object,
+    task_type: str,
+) -> object:
+    """Normalize model predictions to a 1D array when needed."""
+    normalized = np.asarray(predictions)
+    if task_type not in CLASSIFICATION_TASKS:
+        return normalized.ravel() if normalized.ndim > 1 else normalized
+    if normalized.ndim == 1:
+        return normalized
+    if normalized.ndim == 2:
+        return normalized.argmax(axis=1)
+    raise ValueError(f"Unsupported prediction dimensions: {normalized.ndim}")
+
+
 def train_target(
     dataset: TrainingDataset,
     target_name: str,
@@ -190,6 +206,7 @@ def train_target(
         validation_predictions = model.predict(
             dataset.features.iloc[dataset.split_indices.validation_indices]
         )
+        validation_predictions = _normalize_predictions(validation_predictions, task_type)
         validation_probabilities = None
         if task_type in CLASSIFICATION_TASKS:
             try:
@@ -211,6 +228,7 @@ def train_target(
             categorical_columns=dataset.categorical_columns,
         )
         test_predictions = model.predict(dataset.features.iloc[dataset.split_indices.test_indices])
+        test_predictions = _normalize_predictions(test_predictions, task_type)
         test_probabilities = None
         if task_type in CLASSIFICATION_TASKS:
             try:
@@ -263,6 +281,10 @@ def train_target(
     ensemble_validation_predictions = stacking_model.predict(
         dataset.features.iloc[dataset.split_indices.validation_indices]
     )
+    ensemble_validation_predictions = _normalize_predictions(
+        ensemble_validation_predictions,
+        task_type,
+    )
     ensemble_validation_probabilities = None
     if task_type in CLASSIFICATION_TASKS:
         try:
@@ -280,6 +302,7 @@ def train_target(
     ensemble_predictions = stacking_model.predict(
         dataset.features.iloc[dataset.split_indices.test_indices]
     )
+    ensemble_predictions = _normalize_predictions(ensemble_predictions, task_type)
     ensemble_probabilities = None
     if task_type in CLASSIFICATION_TASKS:
         try:
