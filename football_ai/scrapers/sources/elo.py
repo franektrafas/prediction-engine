@@ -62,16 +62,35 @@ class WorldFootballEloSource(BaseDataSource):
 
     def _fetch_team_mapping(self) -> dict[str, str]:
         """Fetch the Elo team-code mapping."""
-        text = self.fetch_text(f"{self.BASE_URL}/teams.tsv")
-        mapping: dict[str, str] = {}
-        for line in text.splitlines():
+        alias_text = self.fetch_text(f"{self.BASE_URL}/teams.tsv")
+        names_text = self.fetch_text(f"{self.BASE_URL}/en.teams.tsv")
+
+        aliases: dict[str, str] = {}
+        for line in alias_text.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            alias_code = parts[0].strip()
+            canonical_code = parts[1].strip()
+            if alias_code and canonical_code:
+                aliases[alias_code] = canonical_code
+
+        names: dict[str, str] = {}
+        for line in names_text.splitlines():
             parts = line.split("\t")
             if len(parts) < 2:
                 continue
             code = parts[0].strip()
             name = parts[1].strip()
             if code and name:
-                mapping[code] = canonicalize_team_name(name)
+                names[code] = canonicalize_team_name(name)
+
+        mapping: dict[str, str] = {}
+        for code, name in names.items():
+            mapping[code] = name
+        for alias_code, canonical_code in aliases.items():
+            if canonical_code in names:
+                mapping[alias_code] = names[canonical_code]
         if not mapping:
             raise ValueError("Could not parse team mapping from teams.tsv")
         return mapping
