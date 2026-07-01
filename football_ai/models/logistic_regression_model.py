@@ -17,10 +17,9 @@ class LogisticRegressionModel(BaseModelWrapper):
         linear_model = _require_dependency("sklearn.linear_model")
         params = {
             "C": self.hyperparameters.get("C", 1.0),
-            "max_iter": self.hyperparameters.get("max_iter", 2000),
+            "max_iter": int(self.hyperparameters.get("max_iter", 2000)),
             "solver": self.hyperparameters.get("solver", "lbfgs"),
             "class_weight": self.hyperparameters.get("class_weight", "balanced"),
-            "multi_class": "auto",
         }
         return linear_model.LogisticRegression(**params)
 
