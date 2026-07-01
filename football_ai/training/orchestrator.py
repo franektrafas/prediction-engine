@@ -66,14 +66,6 @@ class TrainingResult:
 def _build_model_suite(task_type: str, target_name: str) -> list[BaseModelWrapper]:
     """Create the list of candidate models for a target."""
     suite: list[BaseModelWrapper] = []
-    if task_type in CLASSIFICATION_TASKS:
-        suite.append(
-            LogisticRegressionModel(
-                model_name="logistic_regression",
-                task_type=task_type,
-                target_name=target_name,
-            )
-        )
     suite.extend(
         [
             RandomForestModel(
