@@ -58,7 +58,11 @@ class BaseModelWrapper:
         """Create a configured estimator instance."""
         raise NotImplementedError
 
-    def build_pipeline(self, categorical_columns: list[str]) -> Any:
+    def build_pipeline(
+        self,
+        categorical_columns: list[str],
+        numeric_columns: list[str],
+    ) -> Any:
         """Create a preprocessing and estimator pipeline."""
         sklearn_pipeline = _require_dependency("sklearn.pipeline")
         sklearn_compose = _require_dependency("sklearn.compose")
@@ -82,7 +86,7 @@ class BaseModelWrapper:
         )
         preprocessor = sklearn_compose.ColumnTransformer(
             transformers=[
-                ("numeric", numeric_pipeline, lambda frame: frame.select_dtypes(exclude="object").columns),
+                ("numeric", numeric_pipeline, numeric_columns),
                 ("categorical", categorical_pipeline, categorical_columns),
             ],
             remainder="drop",
@@ -103,7 +107,13 @@ class BaseModelWrapper:
         """Fit the model pipeline."""
         self.feature_columns = list(features.columns)
         self.categorical_columns = categorical_columns
-        self.estimator = self.build_pipeline(categorical_columns=categorical_columns)
+        numeric_columns = [
+            column for column in features.columns if column not in categorical_columns
+        ]
+        self.estimator = self.build_pipeline(
+            categorical_columns=categorical_columns,
+            numeric_columns=numeric_columns,
+        )
         self.estimator.fit(features, target)
         return self
 

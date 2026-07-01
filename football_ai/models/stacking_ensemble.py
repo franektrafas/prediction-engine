@@ -47,9 +47,14 @@ class StackingEnsembleModel(BaseModelWrapper):
             passthrough=True,
         )
 
-    def build_pipeline(self, categorical_columns: list[str]) -> Any:
+    def build_pipeline(
+        self,
+        categorical_columns: list[str],
+        numeric_columns: list[str],
+    ) -> Any:
         """Return a direct estimator because base models already contain preprocessors."""
         del categorical_columns
+        del numeric_columns
         return self.build_estimator()
 
     def fit(
