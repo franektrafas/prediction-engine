@@ -184,10 +184,32 @@ Kluczowe tabele:
 
 - StatsBomb Open Data
 - Football-Data.co.uk
+- Football API (API-Sports)
 - World Football Elo Ratings
 - Open-Meteo
 - FBref
 - pliki od uzytkownika z Kaggle
+
+## Test Football API
+
+Po uzupelnieniu `.env` o `FOOTBALL_API_KEY` mozna sprawdzic integracje live:
+
+```bash
+python3 -m football_ai.scrapers.sources.football_api --date 2026-07-10 --next-count 10
+```
+
+Przyklad dla konkretnej druzyny lub rozgrywek:
+
+```bash
+python3 -m football_ai.scrapers.sources.football_api --date 2026-07-10 --team-id 1095
+python3 -m football_ai.scrapers.sources.football_api --date 2026-07-10 --league-id 4 --season 2026
+```
+
+Wynik zostanie:
+
+- wyswietlony w terminalu
+- zapisany jako raw JSON w `football_ai/data/raw/football_api`
+- znormalizowany do kolumn zgodnych z naszym pipeline
 
 ## Trening modeli
 

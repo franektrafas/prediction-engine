@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 
+from dotenv import load_dotenv
+
 
 @dataclass(slots=True)
 class DatabaseSettings:
@@ -33,6 +35,11 @@ class AppSettings:
     database: DatabaseSettings
     project_root: Path
     model_artifact_dir: Path
+    inference_data_path: Path
+    football_api_base_url: str
+    football_api_key: str
+    football_api_host: str
+    football_api_timezone: str
     log_level: str
     default_timezone: str
 
@@ -45,6 +52,7 @@ def _read_env(name: str, default: str) -> str:
 def get_settings() -> AppSettings:
     """Load application settings from environment variables."""
     project_root = Path(__file__).resolve().parents[1]
+    load_dotenv(project_root.parent / ".env")
     database = DatabaseSettings(
         host=_read_env("POSTGRES_HOST", "localhost"),
         port=int(_read_env("POSTGRES_PORT", "5432")),
@@ -55,10 +63,24 @@ def get_settings() -> AppSettings:
     model_artifact_dir = Path(
         _read_env("MODEL_ARTIFACT_DIR", str(project_root / "models" / "artifacts"))
     )
+    inference_data_path = Path(
+        _read_env(
+            "INFERENCE_DATA_PATH",
+            str(project_root / "data" / "processed" / "international_results_modern_with_elo.parquet"),
+        )
+    )
     return AppSettings(
         database=database,
         project_root=project_root,
         model_artifact_dir=model_artifact_dir,
+        inference_data_path=inference_data_path,
+        football_api_base_url=_read_env(
+            "FOOTBALL_API_BASE_URL",
+            "https://v3.football.api-sports.io",
+        ),
+        football_api_key=_read_env("FOOTBALL_API_KEY", ""),
+        football_api_host=_read_env("FOOTBALL_API_HOST", "v3.football.api-sports.io"),
+        football_api_timezone=_read_env("FOOTBALL_API_TIMEZONE", "Europe/Warsaw"),
         log_level=_read_env("LOG_LEVEL", "INFO"),
         default_timezone=_read_env("DEFAULT_TIMEZONE", "UTC"),
     )

@@ -1,0 +1,6 @@
+#!/Users/franektrafas/Documents/Codex/2026-07-01/jeste-seniorem-machine-learning-engineer-data/.venv312/bin/python3.12
+import sys
+from numpy._configtool import main
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(main())

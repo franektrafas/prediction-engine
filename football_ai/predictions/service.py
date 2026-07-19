@@ -4,14 +4,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from numbers import Real
 
 import math
 
 import joblib
+import numpy as np
 import pandas as pd
 
+from football_ai.config.settings import get_settings
+from football_ai.data.io import read_table
 from football_ai.models.base import TrainedArtifact
 from football_ai.models.registry import ModelRegistry
+from football_ai.predictions.inference_feature_builder import build_inference_feature_frame
 from football_ai.predictions.schemas import MatchContextPayload, PredictionResponse, ProbabilityPayload
 
 
@@ -20,16 +25,78 @@ def _logistic(value: float) -> float:
     return 1.0 / (1.0 + math.exp(-value))
 
 
+def _clamp_probability(value: float) -> float:
+    """Clamp a probability into the valid range."""
+    return max(0.0, min(1.0, float(value)))
+
+
+def _normalize_probabilities(probabilities: dict[str, float]) -> dict[str, float]:
+    """Normalize probabilities so they sum to one."""
+    sanitized = {
+        key: _clamp_probability(value)
+        for key, value in probabilities.items()
+    }
+    probability_sum = sum(sanitized.values())
+    if probability_sum <= 0.0:
+        return {"home_win": 1.0 / 3.0, "draw": 1.0 / 3.0, "away_win": 1.0 / 3.0}
+    return {
+        key: value / probability_sum
+        for key, value in sanitized.items()
+    }
+
+
+def _probability_spread(probabilities: dict[str, float]) -> float:
+    """Return the spread between the largest and smallest probability."""
+    values = list(probabilities.values())
+    if not values:
+        return 0.0
+    return max(values) - min(values)
+
+
+def _canonicalize_class_label(label: object) -> object:
+    """Map model-specific class labels into project-level outcome labels."""
+    if isinstance(label, (int, float, np.integer, np.floating)) and not isinstance(label, bool):
+        numeric_mapping = {
+            0: "away_win",
+            1: "draw",
+            2: "home_win",
+        }
+        integer_label = int(label)
+        if float(label) == float(integer_label):
+            return numeric_mapping.get(integer_label, label)
+        return label
+    if isinstance(label, str):
+        normalized = label.strip()
+        string_mapping = {
+            "A": "away_win",
+            "D": "draw",
+            "H": "home_win",
+            "0": "away_win",
+            "1": "draw",
+            "2": "home_win",
+            "away_win": "away_win",
+            "draw": "draw",
+            "home_win": "home_win",
+        }
+        return string_mapping.get(normalized, normalized)
+    return label
+
+
 @dataclass(slots=True)
 class PredictionService:
     """Prediction service that loads trained artifacts when available."""
 
     registry: ModelRegistry
+    historical_matches: pd.DataFrame | None = None
 
     @classmethod
     def create(cls) -> "PredictionService":
         """Create a prediction service with the default registry."""
-        return cls(registry=ModelRegistry())
+        settings = get_settings()
+        historical_matches: pd.DataFrame | None = None
+        if settings.inference_data_path.exists():
+            historical_matches = read_table(settings.inference_data_path)
+        return cls(registry=ModelRegistry(), historical_matches=historical_matches)
 
     def predict(self, payload: MatchContextPayload) -> PredictionResponse:
         """Predict match outcome and statistics."""
@@ -42,6 +109,7 @@ class PredictionService:
             frame=match_frame,
             labels=["away_win", "draw", "home_win"],
         )
+        model_versions = {"match_outcome": registry_entry.version}
         home_goals = self._predict_regression("home_goals", match_frame, default=1.4)
         away_goals = self._predict_regression("away_goals", match_frame, default=1.1)
         home_xg = self._predict_regression("home_xg", match_frame, default=home_goals)
@@ -61,7 +129,36 @@ class PredictionService:
         home_possession = self._predict_regression("home_possession", match_frame, default=53.0)
         away_possession = self._predict_regression("away_possession", match_frame, default=47.0)
         total_goals = home_goals + away_goals
+        outcome_probabilities = self._resolve_outcome_probabilities(
+            payload=payload,
+            model_probabilities=outcome_probabilities,
+            home_goals=home_goals,
+            away_goals=away_goals,
+        )
         btts = self._predict_binary("btts", match_frame, default=float(home_goals > 0 and away_goals > 0))
+        for target_name in (
+            "home_goals",
+            "away_goals",
+            "home_xg",
+            "away_xg",
+            "home_corners",
+            "away_corners",
+            "home_yellow_cards",
+            "away_yellow_cards",
+            "home_shots",
+            "away_shots",
+            "home_shots_on_target",
+            "away_shots_on_target",
+            "home_possession",
+            "away_possession",
+            "btts",
+            "over_1_5",
+            "over_2_5",
+            "over_3_5",
+        ):
+            version = self._get_model_version(target_name)
+            if version is not None:
+                model_versions[target_name] = version
         over_under = {
             "over_1_5": self._predict_binary("over_1_5", match_frame, default=_logistic(total_goals - 1.5)),
             "over_2_5": self._predict_binary("over_2_5", match_frame, default=_logistic(total_goals - 2.5)),
@@ -69,6 +166,7 @@ class PredictionService:
         }
         return PredictionResponse(
             model_version=registry_entry.version,
+            model_versions=model_versions,
             outcome_probabilities=ProbabilityPayload(
                 home_win=outcome_probabilities["home_win"],
                 draw=outcome_probabilities["draw"],
@@ -91,41 +189,10 @@ class PredictionService:
 
     def _build_feature_frame(self, payload: MatchContextPayload) -> pd.DataFrame:
         """Build a single-row feature frame for inference."""
-        frame = pd.DataFrame(
-            [
-                {
-                    "match_id": 1,
-                    "match_date": payload.match_date,
-                    "home_team_name": payload.home_team_name,
-                    "away_team_name": payload.away_team_name,
-                    "tournament": payload.tournament,
-                    "stadium_name": payload.stadium_name,
-                    "country": payload.country,
-                    "neutral_venue": payload.neutral_venue,
-                    "home_elo_pre_match": payload.home_elo or 1500.0,
-                    "away_elo_pre_match": payload.away_elo or 1500.0,
-                    "home_elo": payload.home_elo or 1500.0,
-                    "away_elo": payload.away_elo or 1500.0,
-                    "home_lineup_average_age": payload.home_lineup_average_age or 27.0,
-                    "away_lineup_average_age": payload.away_lineup_average_age or 27.0,
-                    "home_lineup_market_value": payload.home_lineup_market_value or 100000000.0,
-                    "away_lineup_market_value": payload.away_lineup_market_value or 100000000.0,
-                    "home_goalkeeper_form": payload.home_goalkeeper_form or 0.0,
-                    "away_goalkeeper_form": payload.away_goalkeeper_form or 0.0,
-                    "home_forward_form": payload.home_forward_form or 0.0,
-                    "away_forward_form": payload.away_forward_form or 0.0,
-                    "home_travel_distance_km": payload.home_travel_distance_km or 0.0,
-                    "away_travel_distance_km": payload.away_travel_distance_km or 0.0,
-                    "home_xg_mean_5": payload.home_recent_xg or 1.5,
-                    "away_xg_mean_5": payload.away_recent_xg or 1.2,
-                    "home_xga_mean_5": payload.home_recent_xga or 1.1,
-                    "away_xga_mean_5": payload.away_recent_xga or 1.3,
-                    "weather_temperature_c": payload.weather_temperature_c or 18.0,
-                    "weather_precipitation_mm": payload.weather_precipitation_mm or 0.0,
-                }
-            ]
-        )
-        return frame
+        return build_inference_feature_frame(
+            payload=payload,
+            historical_matches=self.historical_matches,
+        ).frame
 
     def _load_artifact(self, artifact_path: str | Path) -> TrainedArtifact:
         """Load a serialized model artifact."""
@@ -142,7 +209,14 @@ class PredictionService:
         for column in loaded_artifact.feature_columns:
             if column not in aligned.columns:
                 aligned[column] = 0.0
-        return aligned[loaded_artifact.feature_columns], loaded_artifact
+        aligned = aligned[loaded_artifact.feature_columns].copy()
+        aligned = aligned.replace([np.inf, -np.inf], np.nan)
+        for column in aligned.columns:
+            if pd.api.types.is_numeric_dtype(aligned[column]):
+                aligned[column] = aligned[column].fillna(0.0)
+            else:
+                aligned[column] = aligned[column].fillna("")
+        return aligned, loaded_artifact
 
     def _predict_classification(
         self,
@@ -154,13 +228,60 @@ class PredictionService:
         aligned, artifact = self._align_features(frame, artifact_path)
         if not hasattr(artifact.estimator, "predict_proba"):
             return self._heuristic_prediction(frame.iloc[0].to_dict()).outcome_probabilities.model_dump()
-        probabilities = artifact.estimator.predict_proba(aligned)[0]
-        label_mapping = dict(zip(getattr(artifact.estimator, "classes_", labels), probabilities, strict=False))
-        return {
-            "home_win": float(label_mapping.get("home_win", label_mapping.get("H", 0.33))),
-            "draw": float(label_mapping.get("draw", label_mapping.get("D", 0.34))),
-            "away_win": float(label_mapping.get("away_win", label_mapping.get("A", 0.33))),
+        probabilities = np.asarray(artifact.estimator.predict_proba(aligned))
+        if probabilities.ndim == 2:
+            probability_values = probabilities[0]
+        else:
+            probability_values = probabilities
+        estimator_with_classes = artifact.estimator
+        if hasattr(artifact.estimator, "named_steps"):
+            estimator_with_classes = artifact.estimator.named_steps.get("estimator", artifact.estimator)
+        raw_classes = getattr(estimator_with_classes, "classes_", labels)
+        classes = [_canonicalize_class_label(label) for label in raw_classes]
+        label_mapping = dict(zip(classes, probability_values, strict=False))
+        if not {"home_win", "draw", "away_win"}.issubset(set(label_mapping)):
+            if len(probability_values) == 3:
+                label_mapping = {
+                    "away_win": float(probability_values[0]),
+                    "draw": float(probability_values[1]),
+                    "home_win": float(probability_values[2]),
+                }
+        return _normalize_probabilities({
+            "home_win": float(label_mapping.get("home_win", 0.33)),
+            "draw": float(label_mapping.get("draw", 0.34)),
+            "away_win": float(label_mapping.get("away_win", 0.33)),
+        })
+
+    def _resolve_outcome_probabilities(
+        self,
+        payload: MatchContextPayload,
+        model_probabilities: dict[str, float],
+        home_goals: float,
+        away_goals: float,
+    ) -> dict[str, float]:
+        """Resolve final outcome probabilities for API responses.
+
+        When the multiclass model produces an almost-flat distribution, fall back
+        to a heuristic estimate informed by Elo and expected goals.
+        """
+        if _probability_spread(model_probabilities) >= 0.05:
+            return model_probabilities
+        heuristic = self._heuristic_prediction(payload)
+        heuristic_probabilities = heuristic.outcome_probabilities.model_dump()
+        goal_margin = home_goals - away_goals
+        goal_based = _normalize_probabilities(
+            {
+                "home_win": _logistic(goal_margin + 0.15),
+                "draw": max(0.08, 1.0 - _logistic(goal_margin + 0.15) - _logistic(-goal_margin - 0.15) * 0.9),
+                "away_win": _logistic(-goal_margin - 0.15) * 0.9,
+            }
+        )
+        blended = {
+            "home_win": 0.65 * heuristic_probabilities["home_win"] + 0.35 * goal_based["home_win"],
+            "draw": 0.65 * heuristic_probabilities["draw"] + 0.35 * goal_based["draw"],
+            "away_win": 0.65 * heuristic_probabilities["away_win"] + 0.35 * goal_based["away_win"],
         }
+        return _normalize_probabilities(blended)
 
     def _predict_binary(
         self,
@@ -174,8 +295,13 @@ class PredictionService:
             return float(default)
         aligned, artifact = self._align_features(frame, registry_entry.artifact_path)
         if hasattr(artifact.estimator, "predict_proba"):
-            return float(artifact.estimator.predict_proba(aligned)[0][1])
-        return float(default)
+            probability = np.asarray(artifact.estimator.predict_proba(aligned))
+            if probability.ndim == 2:
+                positive_class_probability = probability[0][-1]
+            else:
+                positive_class_probability = probability[-1]
+            return _clamp_probability(float(positive_class_probability))
+        return _clamp_probability(float(default))
 
     def _predict_regression(
         self,
@@ -189,6 +315,13 @@ class PredictionService:
             return float(default)
         aligned, artifact = self._align_features(frame, registry_entry.artifact_path)
         return float(artifact.estimator.predict(aligned)[0])
+
+    def _get_model_version(self, target_name: str) -> str | None:
+        """Resolve the latest registered version for a target."""
+        registry_entry = self.registry.get_latest(target_name)
+        if registry_entry is None:
+            return None
+        return registry_entry.version
 
     def _heuristic_prediction(self, payload: MatchContextPayload | dict[str, object]) -> PredictionResponse:
         """Fallback heuristic prediction when trained models are unavailable."""
@@ -211,6 +344,7 @@ class PredictionService:
         total_goals = home_goals + away_goals
         return PredictionResponse(
             model_version="heuristic_baseline_v0",
+            model_versions={"match_outcome": "heuristic_baseline_v0"},
             outcome_probabilities=ProbabilityPayload(
                 home_win=home_win,
                 draw=draw,

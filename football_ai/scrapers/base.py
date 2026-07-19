@@ -34,6 +34,22 @@ class BaseDataSource:
         response.raise_for_status()
         return response.json()
 
+    def fetch_json_with_headers(
+        self,
+        url: str,
+        headers: dict[str, str],
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        """Fetch JSON content using custom HTTP headers."""
+        response = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+        return response.json()
+
     def fetch_text(self, url: str, params: dict[str, Any] | None = None) -> str:
         """Fetch text content from a remote URL."""
         response = requests.get(url, params=params, timeout=self.timeout_seconds)

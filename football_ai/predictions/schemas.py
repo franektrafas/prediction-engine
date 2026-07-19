@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class MatchContextPayload(BaseModel):
@@ -36,6 +37,15 @@ class MatchContextPayload(BaseModel):
     weather_temperature_c: float | None = None
     weather_precipitation_mm: float | None = None
 
+    @field_validator("home_team_name", "away_team_name")
+    @classmethod
+    def validate_team_name(cls, value: str) -> str:
+        """Reject empty team names."""
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Team name cannot be empty.")
+        return normalized
+
 
 class ProbabilityPayload(BaseModel):
     """Three-way outcome probabilities."""
@@ -44,11 +54,23 @@ class ProbabilityPayload(BaseModel):
     draw: float
     away_win: float
 
+    @field_validator("home_win", "draw", "away_win")
+    @classmethod
+    def validate_probability_range(cls, value: float) -> float:
+        """Ensure probabilities are bounded."""
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("Probability must be between 0 and 1.")
+        return value
+
 
 class PredictionResponse(BaseModel):
     """Prediction response for the REST API."""
 
     model_version: str = Field(..., description="Resolved model version or heuristic version.")
+    model_versions: dict[str, str] = Field(
+        default_factory=dict,
+        description="Resolved model version per predicted target.",
+    )
     outcome_probabilities: ProbabilityPayload
     exact_score: dict[str, int]
     goals: dict[str, float]
@@ -60,3 +82,21 @@ class PredictionResponse(BaseModel):
     shots_on_target: dict[str, float]
     xg: dict[str, float]
     possession: dict[str, float]
+
+    @field_validator(
+        "exact_score",
+        "goals",
+        "over_under",
+        "corners",
+        "cards",
+        "shots",
+        "shots_on_target",
+        "xg",
+        "possession",
+    )
+    @classmethod
+    def validate_non_empty_mapping(cls, value: dict[str, Any]) -> dict[str, Any]:
+        """Ensure response mappings are populated."""
+        if not value:
+            raise ValueError("Response mapping cannot be empty.")
+        return value
