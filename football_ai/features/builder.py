@@ -104,6 +104,7 @@ def _add_rolling_features(
 ) -> pd.DataFrame:
     """Create rolling team and venue-specific features."""
     engineered = frame.copy()
+    derived_columns: dict[str, pd.Series] = {}
     for metric in config.rolling_metrics:
         for window in config.rolling_windows:
             shifted = engineered.groupby("team_name")[metric].shift(1)
@@ -115,12 +116,14 @@ def _add_rolling_features(
                 [engineered["team_name"], engineered["is_home"]]
             ).rolling(window=window, min_periods=1)
             for aggregation in config.rolling_aggregations:
-                engineered[f"{metric}_{aggregation}_{window}"] = (
+                derived_columns[f"{metric}_{aggregation}_{window}"] = (
                     rolling_all.aggregate(aggregation).reset_index(level=0, drop=True)
                 )
-                engineered[f"{metric}_{aggregation}_{window}_venue"] = (
+                derived_columns[f"{metric}_{aggregation}_{window}_venue"] = (
                     rolling_venue.aggregate(aggregation).reset_index(level=[0, 1], drop=True)
                 )
+    if derived_columns:
+        engineered = pd.concat([engineered, pd.DataFrame(derived_columns, index=engineered.index)], axis=1)
     return engineered
 
 
@@ -173,12 +176,44 @@ def _add_h2h_features(frame: pd.DataFrame, config: FeatureBuilderConfig) -> pd.D
     return engineered.drop(columns=["h2h_pair", "h2h_signed_result"])
 
 
+def _drop_columns_shadowing_source(
+    engineered_frame: pd.DataFrame,
+    matches: pd.DataFrame,
+    join_key: str,
+) -> pd.DataFrame:
+    """Drop engineered columns that would collide with a column already in `matches`.
+
+    `matches` is always the source of truth for any column it already defines
+    (raw per-match outcome stats such as ``home_xg``/``home_shots``, or
+    pre-match context such as ``home_lineup_average_age``). Without this guard,
+    ``DataFrame.merge`` silently renames both copies to ``*_x``/``*_y`` on a
+    name collision. That has two dangerous consequences: (1) every later
+    exact-name lookup (targets in ``_build_targets``, categorical columns,
+    relative-feature diffs) silently stops finding the column and drops it,
+    and (2) the *engineered* copy of a raw outcome stat (the current match's
+    own xG, shots, possession, ...) survives under the suffixed name and gets
+    picked up as a plain numeric feature -- i.e. the model is trained on the
+    answer to the question it is meant to predict. Dropping the shadowing
+    engineered column keeps `matches`' original value intact and removes the
+    collision (and the leak) entirely.
+    """
+    source_columns = set(matches.columns)
+    columns_to_drop = [
+        column
+        for column in engineered_frame.columns
+        if column in source_columns and column != join_key
+    ]
+    return engineered_frame.drop(columns=columns_to_drop)
+
+
 def _wide_merge(engineered_long_frame: pd.DataFrame, matches: pd.DataFrame) -> pd.DataFrame:
     """Merge home and away engineered features back into match rows."""
     home_features = engineered_long_frame.loc[engineered_long_frame["is_home"] == 1].copy()
     away_features = engineered_long_frame.loc[engineered_long_frame["is_home"] == 0].copy()
     home_features = home_features.add_prefix("home_")
     away_features = away_features.add_prefix("away_")
+    home_features = _drop_columns_shadowing_source(home_features, matches, join_key="home_match_id")
+    away_features = _drop_columns_shadowing_source(away_features, matches, join_key="away_match_id")
     merged = matches.copy()
     merged = merged.merge(
         home_features,
@@ -198,6 +233,7 @@ def _wide_merge(engineered_long_frame: pd.DataFrame, matches: pd.DataFrame) -> p
 def _add_relative_features(frame: pd.DataFrame, config: FeatureBuilderConfig) -> pd.DataFrame:
     """Create home-away deltas and ratios for core rolling features."""
     engineered = frame.copy()
+    derived_columns: dict[str, pd.Series] = {}
     for metric in config.rolling_metrics + (
         "elo_pre_match",
         "rest_days",
@@ -214,11 +250,11 @@ def _add_relative_features(frame: pd.DataFrame, config: FeatureBuilderConfig) ->
                 home_column = f"home_{metric}_{aggregation}_{window}"
                 away_column = f"away_{metric}_{aggregation}_{window}"
                 if home_column in engineered.columns and away_column in engineered.columns:
-                    engineered[f"{metric}_{aggregation}_{window}_diff"] = (
+                    derived_columns[f"{metric}_{aggregation}_{window}_diff"] = (
                         engineered[home_column] - engineered[away_column]
                     )
                     denominator = engineered[away_column].replace(0, np.nan).abs()
-                    engineered[f"{metric}_{aggregation}_{window}_ratio"] = (
+                    derived_columns[f"{metric}_{aggregation}_{window}_ratio"] = (
                         engineered[home_column] / denominator
                     ).replace([np.inf, -np.inf], np.nan)
 
@@ -230,7 +266,9 @@ def _add_relative_features(frame: pd.DataFrame, config: FeatureBuilderConfig) ->
     ]
     for home_column, away_column, output_column in direct_pairs:
         if home_column in engineered.columns and away_column in engineered.columns:
-            engineered[output_column] = engineered[home_column] - engineered[away_column]
+            derived_columns[output_column] = engineered[home_column] - engineered[away_column]
+    if derived_columns:
+        engineered = pd.concat([engineered, pd.DataFrame(derived_columns, index=engineered.index)], axis=1)
     return engineered
 
 
@@ -302,6 +340,37 @@ def build_features(
             "home_match_date",
             "away_match_date",
         ]
+    )
+    # Raw per-match outcome statistics (as opposed to their rolling/historical
+    # aggregates) are only known *after* kickoff. Some of these already become
+    # explicit prediction targets in `_build_targets`, but the raw `matches`
+    # frame coming from `team_statistics`-style sources can carry additional
+    # post-match fields (fouls, offsides, duels won, saves, pass counts, ...)
+    # that have no corresponding target here. Left unguarded, any such column
+    # would flow straight into `numeric_columns` as a feature and leak the
+    # match outcome into its own prediction. Exclude the full raw-stat family
+    # explicitly rather than relying on the target list to happen to cover it.
+    RAW_MATCH_OUTCOME_FIELDS = (
+        "goals",
+        "xg",
+        "xga",
+        "possession_pct",
+        "possession",
+        "shots",
+        "shots_on_target",
+        "corners",
+        "yellow_cards",
+        "red_cards",
+        "fouls",
+        "offsides",
+        "passes_completed",
+        "passes_attempted",
+        "pressing_intensity",
+        "duels_won",
+        "saves",
+    )
+    excluded_columns.update(
+        f"{side}_{field}" for side in ("home", "away") for field in RAW_MATCH_OUTCOME_FIELDS
     )
     target_columns = set(_build_targets(feature_frame).keys())
     numeric_columns = [

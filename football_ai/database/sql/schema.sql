@@ -31,6 +31,12 @@ CREATE TABLE IF NOT EXISTS matches (
     id BIGSERIAL PRIMARY KEY,
     external_id VARCHAR(64) NOT NULL,
     source VARCHAR(32) NOT NULL,
+    -- Kept generic on purpose: this platform is meant to grow into a
+    -- universal (international + club) prediction engine. V1 only ingests
+    -- international competitions, but every match is tagged from day one so
+    -- club football can be added later without a backfill migration.
+    competition_type VARCHAR(16) NOT NULL DEFAULT 'international'
+        CONSTRAINT ck_matches_competition_type CHECK (competition_type IN ('international', 'club')),
     competition_id VARCHAR(64),
     competition_name VARCHAR(120),
     season_name VARCHAR(64),
@@ -56,6 +62,7 @@ CREATE TABLE IF NOT EXISTS matches (
 CREATE INDEX IF NOT EXISTS ix_matches_date ON matches (match_date);
 CREATE INDEX IF NOT EXISTS ix_matches_date_teams
     ON matches (match_date, home_team_id, away_team_id);
+CREATE INDEX IF NOT EXISTS ix_matches_competition_type ON matches (competition_type);
 
 CREATE TABLE IF NOT EXISTS lineups (
     id BIGSERIAL PRIMARY KEY,

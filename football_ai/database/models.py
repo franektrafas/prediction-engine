@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-from sqlalchemy import JSON, Boolean, Date, DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import JSON, Boolean, CheckConstraint, Date, DateTime, Float, ForeignKey, Integer, String
 from sqlalchemy import Index, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -60,11 +60,21 @@ class Match(Base):
     __table_args__ = (
         UniqueConstraint("source", "external_id", name="uq_matches_source_external_id"),
         Index("ix_matches_date_teams", "match_date", "home_team_id", "away_team_id"),
+        CheckConstraint(
+            "competition_type IN ('international', 'club')",
+            name="ck_matches_competition_type",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     external_id: Mapped[str] = mapped_column(String(64))
     source: Mapped[str] = mapped_column(String(32), index=True)
+    # Generic on purpose: keeps the door open for club football later without
+    # renaming tables/classes or backfilling a migration. V1 only populates
+    # "international", but every match is tagged from the start.
+    competition_type: Mapped[str] = mapped_column(
+        String(16), default="international", server_default="international", index=True
+    )
     competition_id: Mapped[str | None] = mapped_column(String(64), index=True)
     competition_name: Mapped[str | None] = mapped_column(String(120))
     season_name: Mapped[str | None] = mapped_column(String(64))

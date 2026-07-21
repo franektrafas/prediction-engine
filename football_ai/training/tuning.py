@@ -8,7 +8,7 @@ import pandas as pd
 
 from football_ai.evaluation.metrics import evaluate_predictions
 from football_ai.models.base import BaseModelWrapper, CLASSIFICATION_TASKS, _require_dependency
-from football_ai.training.splitters import rolling_time_series_splits
+from football_ai.training.splitters import rolling_positional_splits
 
 
 def _sample_hyperparameters(
@@ -31,10 +31,17 @@ def tune_model(
     features: pd.DataFrame,
     target: pd.Series,
     categorical_columns: list[str],
-    date_column: str = "match_date",
     n_trials: int = 20,
 ) -> dict[str, Any]:
-    """Tune a model with Optuna using rolling time-series validation."""
+    """Tune a model with Optuna using rolling time-series validation.
+
+    `features`/`target` must already be sorted chronologically (earliest row
+    first) by the caller -- see `training.datasets.build_training_dataset` and
+    `training.orchestrator.train_target`, which both derive their train/validation
+    slices from `chronological_train_validation_test_split`. Folds are built
+    purely from row position (`rolling_positional_splits`), so there is no
+    date column to (re)derive or fake here.
+    """
     optuna = _require_dependency("optuna")
     score_name = "f1" if model.task_type in CLASSIFICATION_TASKS else "rmse"
     direction = "maximize" if model.task_type in CLASSIFICATION_TASKS else "minimize"
@@ -43,9 +50,8 @@ def tune_model(
         """Optimization objective."""
         hyperparameters = _sample_hyperparameters(trial, model)
         scores: list[float] = []
-        for train_indices, validation_indices in rolling_time_series_splits(
-            features.assign(**{date_column: pd.RangeIndex(len(features))}),
-            date_column=date_column,
+        for train_indices, validation_indices in rolling_positional_splits(
+            len(features),
             n_splits=4,
         ):
             candidate = model.__class__(
