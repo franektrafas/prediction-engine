@@ -2,9 +2,32 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
+
+import pandas as pd
 
 from football_ai.scrapers.sources.football_api import FootballApiSource
+
+
+def _squad_frame(team_external_id: int, team_name: str, players: list[tuple[str, int]]) -> pd.DataFrame:
+    """Build a squad DataFrame matching `normalize_team_squad`'s output shape."""
+    return pd.DataFrame(
+        [
+            {
+                "team_external_id": team_external_id,
+                "team_name": team_name,
+                "player_external_id": external_id,
+                "player_name": player_name,
+                "age": 25.0,
+                "position": "Midfielder",
+                "number": index + 1,
+            }
+            for index, (player_name, external_id) in enumerate(players)
+        ]
+    )
 
 
 class FootballApiSourceTestCase(unittest.TestCase):
@@ -69,6 +92,51 @@ class FootballApiSourceTestCase(unittest.TestCase):
         self.assertTrue(bool(frame.iloc[0]["started"]))
         self.assertFalse(bool(frame.iloc[1]["started"]))
         self.assertEqual(frame.iloc[0]["fixture_id"], 54321)
+
+    def test_refresh_player_reference_merges_multiple_team_squads(self) -> None:
+        """Squads from every requested team should land in one merged store."""
+        squads = {
+            10: _squad_frame(10, "Poland", [("Player One", 1), ("Player Two", 2)]),
+            20: _squad_frame(20, "Portugal", [("Player Three", 3)]),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference_path = Path(temp_dir) / "player_reference.csv"
+            with mock.patch.object(self.source, "fetch_team_squad", side_effect=lambda team_id: squads[team_id]):
+                result = self.source.refresh_player_reference([10, 20], player_reference_path=reference_path)
+        self.assertEqual(result.added_players, 3)
+        self.assertEqual(len(result.frame), 3)
+        self.assertEqual(
+            set(result.frame["player_name"]),
+            {"Player One", "Player Two", "Player Three"},
+        )
+
+    def test_refresh_player_reference_skips_a_failing_team(self) -> None:
+        """One team's fetch failing should not stop the others from being stored."""
+        good_squad = _squad_frame(10, "Poland", [("Player One", 1)])
+
+        def fetch_side_effect(team_id: int) -> pd.DataFrame:
+            if team_id == 20:
+                raise RuntimeError("rate limited")
+            return good_squad
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference_path = Path(temp_dir) / "player_reference.csv"
+            with mock.patch.object(self.source, "fetch_team_squad", side_effect=fetch_side_effect):
+                result = self.source.refresh_player_reference([10, 20], player_reference_path=reference_path)
+        self.assertEqual(result.added_players, 1)
+        self.assertEqual(list(result.frame["player_name"]), ["Player One"])
+
+    def test_refresh_player_reference_handles_every_team_failing(self) -> None:
+        """A refresh where every team fails should degrade gracefully, not raise."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference_path = Path(temp_dir) / "player_reference.csv"
+            with mock.patch.object(
+                self.source, "fetch_team_squad", side_effect=RuntimeError("boom")
+            ):
+                result = self.source.refresh_player_reference([10, 20], player_reference_path=reference_path)
+        self.assertEqual(result.added_players, 0)
+        self.assertEqual(result.updated_players, 0)
+        self.assertEqual(len(result.frame), 0)
 
 
 if __name__ == "__main__":

@@ -10,8 +10,10 @@ from sqlalchemy import select
 
 from football_ai.database.models import Match
 from football_ai.database.session import SessionLocal
+from football_ai.predictions.player_reference_store import PlayerReferenceUpdateResult
 from football_ai.scrapers.sources.elo import WorldFootballEloSource
 from football_ai.scrapers.sources.fbref import FBrefSource
+from football_ai.scrapers.sources.football_api import FootballApiSource
 from football_ai.scrapers.sources.football_data import FootballDataSource
 from football_ai.scrapers.sources.kaggle_importer import KaggleFileImporter
 from football_ai.scrapers.sources.open_meteo import OpenMeteoSource
@@ -28,6 +30,7 @@ class DataIngestionPipeline:
     open_meteo_source: OpenMeteoSource
     fbref_source: FBrefSource
     kaggle_source: KaggleFileImporter
+    football_api_source: FootballApiSource
 
     @classmethod
     def create(cls) -> "DataIngestionPipeline":
@@ -39,6 +42,7 @@ class DataIngestionPipeline:
             open_meteo_source=OpenMeteoSource(),
             fbref_source=FBrefSource(),
             kaggle_source=KaggleFileImporter(),
+            football_api_source=FootballApiSource(),
         )
 
     def ingest_statsbomb_competition(self, competition_id: int, season_id: int) -> None:
@@ -85,6 +89,10 @@ class DataIngestionPipeline:
         """Normalize and persist a user-provided Kaggle file."""
         self.kaggle_source.import_file(path)
 
+    def refresh_player_reference(self, team_ids: list[int]) -> PlayerReferenceUpdateResult:
+        """Refresh the player reference store from Football API squads."""
+        return self.football_api_source.refresh_player_reference(team_ids)
+
     def run_scheduled_refresh(self) -> None:
         """Execute configured refresh steps from environment variables."""
         statsbomb_competition = os.getenv("STATSBOMB_COMPETITION_ID")
@@ -94,6 +102,7 @@ class DataIngestionPipeline:
         fbref_file = os.getenv("FBREF_FILE_PATH")
         kaggle_file = os.getenv("KAGGLE_FILE_PATH")
         refresh_weather = os.getenv("REFRESH_WEATHER", "false").lower() == "true"
+        player_reference_team_ids = os.getenv("PLAYER_REFERENCE_TEAM_IDS")
 
         if statsbomb_competition and statsbomb_season:
             self.ingest_statsbomb_competition(
@@ -110,6 +119,9 @@ class DataIngestionPipeline:
             self.import_kaggle_file(kaggle_file)
         if refresh_weather:
             self.enrich_weather()
+        if player_reference_team_ids:
+            team_ids = [int(value) for value in player_reference_team_ids.split(",") if value.strip()]
+            self.refresh_player_reference(team_ids)
 
 
 if __name__ == "__main__":

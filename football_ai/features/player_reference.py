@@ -74,7 +74,13 @@ def update_player_reference(
     for columns where the new observation provides a non-null value.
     """
     if observed_players.empty:
-        empty_reference = _ensure_reference_columns(existing_reference or pd.DataFrame())
+        # `existing_reference or pd.DataFrame()` would call `bool()` on a
+        # DataFrame whenever `existing_reference` isn't None -- pandas raises
+        # "The truth value of a DataFrame is ambiguous" for that regardless of
+        # whether the frame is empty, so this has to be an explicit None check.
+        empty_reference = _ensure_reference_columns(
+            existing_reference if existing_reference is not None else pd.DataFrame()
+        )
         return PlayerReferenceUpdateResult(
             frame=empty_reference,
             added_players=0,

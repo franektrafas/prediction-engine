@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,14 @@ from sqlalchemy.orm import Session
 
 from football_ai.data.normalization import canonicalize_team_name
 from football_ai.database.models import Injury, Match, Player, Team
+from football_ai.predictions.player_reference_store import (
+    PlayerReferenceUpdateResult,
+    update_player_reference_store,
+)
 from football_ai.scrapers.base import BaseDataSource
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class FootballApiSource(BaseDataSource):
@@ -92,6 +100,38 @@ class FootballApiSource(BaseDataSource):
         self.persist_raw_json(payload, f"squad_{team_id}.json")
         self._raise_for_api_errors(payload)
         return self.normalize_team_squad(payload)
+
+    def refresh_player_reference(
+        self,
+        team_ids: list[int],
+        player_reference_path: str | Path | None = None,
+    ) -> PlayerReferenceUpdateResult:
+        """Fetch squads for the given teams and merge them into the player reference store.
+
+        Resilient per team: a single team's fetch failing (bad id, rate
+        limit, network) is logged and skipped rather than aborting the whole
+        refresh, so a scheduled batch still updates whatever teams it could
+        reach. If every team fails, the store is left untouched and the
+        result reports zero additions/updates rather than raising -- this is
+        a maintenance job, not a user-facing request, so a partial or total
+        failure should show up in logs, not crash the caller.
+        """
+        resolved_path = Path(player_reference_path) if player_reference_path else self.settings.player_reference_path
+        squads: list[pd.DataFrame] = []
+        for team_id in team_ids:
+            try:
+                squad = self.fetch_team_squad(team_id)
+            except Exception:
+                LOGGER.warning("Failed to fetch squad for team %s", team_id, exc_info=True)
+                continue
+            if not squad.empty:
+                squads.append(squad)
+        combined = pd.concat(squads, ignore_index=True) if squads else pd.DataFrame()
+        return update_player_reference_store(
+            resolved_path,
+            observed_players=combined,
+            source_name="football_api",
+        )
 
     def _raise_for_api_errors(self, payload: dict[str, Any]) -> None:
         """Raise a readable exception when the provider returns API-level errors."""
@@ -337,15 +377,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fetch live football data from the configured Football API.")
     parser.add_argument(
         "--mode",
-        choices=("fixtures", "lineups"),
+        choices=("fixtures", "lineups", "squad"),
         default="fixtures",
-        help="Whether to fetch fixtures for a date or lineups for a fixture.",
+        help="Whether to fetch fixtures for a date, lineups for a fixture, or refresh player-reference squads.",
     )
     parser.add_argument("--date", default=None, help="Fixture date in YYYY-MM-DD format.")
     parser.add_argument("--fixture-id", type=int, default=None, help="Fixture identifier for lineup fetches.")
     parser.add_argument("--league-id", type=int, default=None, help="Optional league identifier.")
     parser.add_argument("--season", type=int, default=None, help="Optional season year.")
     parser.add_argument("--team-id", type=int, default=None, help="Optional team identifier.")
+    parser.add_argument(
+        "--team-ids",
+        default=None,
+        help="Comma-separated team identifiers to refresh player-reference squads for (squad mode).",
+    )
     parser.add_argument("--last", type=int, default=None, help="Fetch the last N fixtures.")
     parser.add_argument("--next-count", type=int, default=None, help="Fetch the next N fixtures.")
     arguments = parser.parse_args()
@@ -366,7 +411,7 @@ if __name__ == "__main__":
         print(f"Fetched {len(fixtures)} normalized fixtures.")
         print(fixtures.head(10).to_string(index=False))
         print(f"Raw payloads are stored in {output_directory}.")
-    else:
+    elif arguments.mode == "lineups":
         if arguments.fixture_id is None:
             raise ValueError("--fixture-id is required when --mode lineups is used.")
         lineups = source.fetch_fixture_lineups(arguments.fixture_id)
@@ -376,3 +421,16 @@ if __name__ == "__main__":
         else:
             print(lineups.head(30).to_string(index=False))
         print(f"Raw payloads are stored in {output_directory}.")
+    else:
+        team_ids_argument = arguments.team_ids or (
+            str(arguments.team_id) if arguments.team_id is not None else None
+        )
+        if not team_ids_argument:
+            raise ValueError("--team-ids (or --team-id) is required when --mode squad is used.")
+        team_ids = [int(value) for value in team_ids_argument.split(",") if value.strip()]
+        result = source.refresh_player_reference(team_ids)
+        print(
+            f"Refreshed player reference from {len(team_ids)} team squad(s): "
+            f"+{result.added_players} added, {result.updated_players} updated, "
+            f"{len(result.frame)} total players in {source.settings.player_reference_path}."
+        )
