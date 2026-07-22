@@ -30,6 +30,10 @@ REFERENCE_BASE_COLUMNS = (
     "last_updated_source",
 )
 
+REFERENCE_MERGE_COLUMNS = tuple(
+    column for column in REFERENCE_BASE_COLUMNS if column != "last_updated_source"
+)
+
 
 @dataclass(slots=True)
 class PlayerReferenceUpdateResult:
@@ -46,6 +50,7 @@ def _ensure_reference_columns(frame: pd.DataFrame) -> pd.DataFrame:
     for column in REFERENCE_BASE_COLUMNS:
         if column not in reference.columns:
             reference[column] = pd.NA
+        reference[column] = reference[column].astype("object")
     return reference
 
 
@@ -85,7 +90,12 @@ def update_player_reference(
     existing = _ensure_reference_columns(
         existing_reference if existing_reference is not None else pd.DataFrame()
     )
-    observed = _ensure_reference_columns(observed_players)
+    observed = _ensure_reference_columns(
+        observed_players.loc[
+            :,
+            [column for column in observed_players.columns if column in REFERENCE_MERGE_COLUMNS],
+        ]
+    )
 
     observed["last_updated_source"] = source_name
     existing_keyed = _with_lookup_keys(existing)
