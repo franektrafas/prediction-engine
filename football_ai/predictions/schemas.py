@@ -14,6 +14,15 @@ class MatchContextPayload(BaseModel):
     match_date: datetime
     home_team_name: str
     away_team_name: str
+    fixture_id: int | None = Field(
+        default=None,
+        description=(
+            "Optional api-football.com fixture id. When set, /predict enriches "
+            "lineup-derived fields (form, market value, age, ...) from live "
+            "lineups before running inference, without overriding any value "
+            "already supplied explicitly."
+        ),
+    )
     tournament: str | None = None
     stadium_name: str | None = None
     country: str | None = None
