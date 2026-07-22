@@ -1,0 +1,201 @@
+"""Tests for Phase 5's Tier-A feature additions (streaks, Elo momentum, etc.)."""
+
+from __future__ import annotations
+
+import unittest
+
+import pandas as pd
+
+from football_ai.features.builder import _match_importance_tier, build_features
+
+
+def _alpha_matches() -> pd.DataFrame:
+    """Build a 7-match sequence for "Alpha" with a controlled win/draw/loss pattern.
+
+    Pattern (Alpha always home): win, win, draw, loss, win, win, win -- chosen
+    so the win/loss-streak assertions below have unambiguous expected values:
+    two wins before match 3, a reset at the match-3 draw, a loss at match 4,
+    and a fresh two-win streak built back up by match 7.
+    """
+    rows = [
+        {
+            "match_date": "2023-01-01",
+            "home_team_name": "Alpha",
+            "away_team_name": "Opponent1",
+            "home_score": 2,
+            "away_score": 0,
+            "home_xg": 1.8,
+            "away_xg": 0.4,
+            "home_elo": 1500,
+            "away_elo": 1500,
+            "tournament": "International Friendly",
+            "country": "Neutralia",
+        },
+        {
+            "match_date": "2023-01-04",
+            "home_team_name": "Alpha",
+            "away_team_name": "Opponent2",
+            "home_score": 3,
+            "away_score": 1,
+            "home_xg": 2.5,
+            "away_xg": 1.0,
+            "home_elo": 1550,
+            "away_elo": 1500,
+            "tournament": "FIFA World Cup",
+            "country": "Alpha",
+        },
+        {
+            "match_date": "2023-01-07",
+            "home_team_name": "Alpha",
+            "away_team_name": "Opponent3",
+            "home_score": 1,
+            "away_score": 1,
+            "home_xg": 1.1,
+            "away_xg": 1.2,
+            "home_elo": 1600,
+            "away_elo": 1500,
+            "tournament": "FIFA World Cup Qualifying",
+            "country": "Alpha",
+        },
+        {
+            "match_date": "2023-01-10",
+            "home_team_name": "Alpha",
+            "away_team_name": "Opponent4",
+            "home_score": 0,
+            "away_score": 2,
+            "home_xg": 0.6,
+            "away_xg": 1.9,
+            "home_elo": 1590,
+            "away_elo": 1500,
+            "tournament": "UEFA Euro",
+            "country": "Neutralia",
+        },
+        {
+            "match_date": "2023-01-13",
+            "home_team_name": "Alpha",
+            "away_team_name": "Opponent5",
+            "home_score": 1,
+            "away_score": 0,
+            "home_xg": 1.3,
+            "away_xg": 0.5,
+            "home_elo": 1560,
+            "away_elo": 1500,
+            "tournament": "Some Regional Cup",
+            "country": "Neutralia",
+        },
+        {
+            "match_date": "2023-01-16",
+            "home_team_name": "Alpha",
+            "away_team_name": "Opponent6",
+            "home_score": 2,
+            "away_score": 0,
+            "home_xg": 1.7,
+            "away_xg": 0.3,
+            "home_elo": 1580,
+            "away_elo": 1500,
+            "tournament": "International Friendly",
+            "country": "Neutralia",
+        },
+        {
+            "match_date": "2023-01-19",
+            "home_team_name": "Alpha",
+            "away_team_name": "Opponent7",
+            "home_score": 1,
+            "away_score": 0,
+            "home_xg": 1.4,
+            "away_xg": 0.4,
+            "home_elo": 1620,
+            "away_elo": 1500,
+            "tournament": "FIFA World Cup",
+            "country": "Alpha",
+        },
+    ]
+    return pd.DataFrame(rows)
+
+
+class MatchImportanceTierTestCase(unittest.TestCase):
+    """Validate the tournament-name keyword classifier in isolation."""
+
+    def test_classifies_friendly_as_tier_0(self) -> None:
+        """A friendly should classify as tier 0."""
+        self.assertEqual(_match_importance_tier("International Friendly"), 0)
+
+    def test_classifies_qualifier_as_tier_1(self) -> None:
+        """A qualifier -- even for a major tournament -- should classify as tier 1."""
+        self.assertEqual(_match_importance_tier("FIFA World Cup Qualifying"), 1)
+
+    def test_classifies_major_tournament_as_tier_2(self) -> None:
+        """A recognized major tournament should classify as tier 2."""
+        self.assertEqual(_match_importance_tier("UEFA Euro"), 2)
+        self.assertEqual(_match_importance_tier("FIFA World Cup"), 2)
+
+    def test_unrecognized_tournament_falls_back_to_tier_1(self) -> None:
+        """An unrecognized tournament string should fall back to tier 1, not error."""
+        self.assertEqual(_match_importance_tier("Some Regional Cup"), 1)
+        self.assertEqual(_match_importance_tier(None), 1)
+
+
+class TierAFeatureIntegrationTestCase(unittest.TestCase):
+    """Validate the new features end to end through build_features()."""
+
+    def setUp(self) -> None:
+        """Build the feature result once for all assertions in this class."""
+        self.result = build_features(_alpha_matches())
+        self.frame = self.result.frame
+
+    def test_raw_outcome_indicators_are_excluded_but_rolling_versions_survive(self) -> None:
+        """The leak-safety regression this phase most needs to get right."""
+        self.assertNotIn("home_btts_flag", self.result.feature_columns)
+        self.assertNotIn("away_clean_sheet_flag", self.result.feature_columns)
+        self.assertNotIn("home_over_2_5_flag", self.result.feature_columns)
+        self.assertIn("home_btts_flag_mean_3", self.result.feature_columns)
+        self.assertIn("home_clean_sheet_flag_mean_3", self.result.feature_columns)
+        self.assertIn("home_over_2_5_flag_mean_3", self.result.feature_columns)
+
+    def test_win_streak_accumulates_and_resets_on_draw(self) -> None:
+        """Two prior wins should show as a streak of 2 right before the draw at match 3."""
+        row = self.frame.loc[self.frame["away_team_name"] == "Opponent3"].iloc[0]
+        self.assertEqual(row["home_win_streak"], 2.0)
+
+    def test_win_streak_resets_after_a_loss_then_rebuilds(self) -> None:
+        """The streak should be back to 0 right after the match-4 loss, then rebuild to 2 by match 7."""
+        after_loss = self.frame.loc[self.frame["away_team_name"] == "Opponent5"].iloc[0]
+        self.assertEqual(after_loss["home_win_streak"], 0.0)
+        self.assertEqual(after_loss["home_loss_streak"], 1.0)
+
+        rebuilt = self.frame.loc[self.frame["away_team_name"] == "Opponent7"].iloc[0]
+        self.assertEqual(rebuilt["home_win_streak"], 2.0)
+        self.assertEqual(rebuilt["home_loss_streak"], 0.0)
+
+    def test_elo_change_matches_hand_computed_delta(self) -> None:
+        """elo_change should equal this row's own elo_pre_match minus the previous match's."""
+        row = self.frame.loc[self.frame["away_team_name"] == "Opponent3"].iloc[0]
+        # home_elo: match1=1500, match2=1550, match3=1600 -> elo_change at match3 = 1600-1550 = 50
+        self.assertAlmostEqual(row["home_elo_change"], 50.0)
+
+    def test_match_importance_tier_present_on_the_wide_frame(self) -> None:
+        """The wide frame should carry the classified tier per match."""
+        friendly_row = self.frame.loc[self.frame["away_team_name"] == "Opponent1"].iloc[0]
+        world_cup_row = self.frame.loc[self.frame["away_team_name"] == "Opponent2"].iloc[0]
+        qualifier_row = self.frame.loc[self.frame["away_team_name"] == "Opponent3"].iloc[0]
+        self.assertEqual(friendly_row["match_importance_tier"], 0)
+        self.assertEqual(world_cup_row["match_importance_tier"], 2)
+        self.assertEqual(qualifier_row["match_importance_tier"], 1)
+
+    def test_tournament_host_flag_matches_country_to_team_name(self) -> None:
+        """home_is_tournament_host should be true only when country matches the home team."""
+        hosted_row = self.frame.loc[self.frame["away_team_name"] == "Opponent2"].iloc[0]
+        neutral_row = self.frame.loc[self.frame["away_team_name"] == "Opponent1"].iloc[0]
+        self.assertEqual(hosted_row["home_is_tournament_host"], 1.0)
+        self.assertEqual(neutral_row["home_is_tournament_host"], 0.0)
+
+    def test_composite_attack_and_defense_indices_present(self) -> None:
+        """The composite indices and their home-away diff should exist and be numeric."""
+        for column in ("home_attack_index_3", "away_attack_index_3", "attack_index_3_diff"):
+            self.assertIn(column, self.result.feature_columns)
+        for column in ("home_defense_index_3", "away_defense_index_3", "defense_index_3_diff"):
+            self.assertIn(column, self.result.feature_columns)
+
+
+if __name__ == "__main__":
+    unittest.main()

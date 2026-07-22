@@ -23,6 +23,16 @@ class FeatureBuilderConfig:
         "cards",
         "possession",
         "pressing_intensity",
+        # Outcome-rate indicators (see features.builder._add_outcome_indicator_columns) --
+        # rolling these gives e.g. "BTTS % over the last 5 matches". The raw,
+        # unrolled per-match values are excluded from the feature set via
+        # RAW_MATCH_OUTCOME_FIELDS since they're derived from this match's own score.
+        "btts_flag",
+        "clean_sheet_flag",
+        "over_2_5_flag",
+        # Match-over-match Elo delta (see features.builder._add_elo_momentum_column) --
+        # rolling this gives "is this team's Elo trending up or down lately".
+        "elo_change",
     )
     rolling_aggregations: tuple[str, ...] = ("mean", "std", "min", "max")
     h2h_windows: tuple[int, ...] = (3, 5)
