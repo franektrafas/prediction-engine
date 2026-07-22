@@ -8,7 +8,7 @@ from datetime import date
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from football_ai.database.models import EloRating, Match, ModelVersion, Team
+from football_ai.database.models import EloRating, Match, ModelVersion, Prediction, Team
 
 
 @dataclass(slots=True)
@@ -91,3 +91,49 @@ class ModelVersionRepository:
         self.session.add(model_version)
         self.session.flush()
         return model_version
+
+    def get_or_create(
+        self,
+        *,
+        version: str,
+        model_name: str,
+        target_name: str,
+        task_type: str,
+        metrics: dict[str, float] | None = None,
+        feature_names: list[str] | None = None,
+        artifact_path: str = "",
+    ) -> ModelVersion:
+        """Fetch a model version row or create one for the (version, model_name, target_name) key."""
+        query = select(ModelVersion).where(
+            ModelVersion.version == version,
+            ModelVersion.model_name == model_name,
+            ModelVersion.target_name == target_name,
+        )
+        existing = self.session.execute(query).scalar_one_or_none()
+        if existing is not None:
+            return existing
+        model_version_row = ModelVersion(
+            version=version,
+            model_name=model_name,
+            target_name=target_name,
+            task_type=task_type,
+            metrics=metrics,
+            feature_names=feature_names,
+            artifact_path=artifact_path,
+        )
+        self.session.add(model_version_row)
+        self.session.flush()
+        return model_version_row
+
+
+@dataclass(slots=True)
+class PredictionRepository:
+    """Repository for served prediction records."""
+
+    session: Session
+
+    def save(self, prediction: Prediction) -> Prediction:
+        """Persist a prediction entity."""
+        self.session.add(prediction)
+        self.session.flush()
+        return prediction
