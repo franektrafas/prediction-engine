@@ -15,7 +15,6 @@ authors = [
 dependencies = [
   "catboost>=1.2.7",
   "fastapi>=0.116.0",
-  "httpx2>=2.2.0",
   "joblib>=1.5.1",
   "lightgbm>=4.6.0",
   "matplotlib>=3.10.3",
