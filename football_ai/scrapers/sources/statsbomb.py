@@ -3,14 +3,53 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import argparse
+import logging
 from typing import Any
 
 import pandas as pd
 from sqlalchemy.orm import Session
 
+from football_ai.data.io import write_table
 from football_ai.data.normalization import canonicalize_team_name
 from football_ai.database.models import Match, Team, TeamStatistic
 from football_ai.scrapers.base import BaseDataSource
+
+
+LOGGER = logging.getLogger(__name__)
+
+# Verified via StatsBomb's public `competitions.json` -- every international/
+# national-team competition (men's + women's) they publish open data for.
+# Free, no auth, no rate limit (static JSON on GitHub raw). Deliberately
+# excludes their club competitions (La Liga, Champions League, FAWSL, ...).
+INTERNATIONAL_COMPETITIONS: tuple[tuple[int, int, str], ...] = (
+    (43, 106, "FIFA World Cup 2022"),
+    (43, 3, "FIFA World Cup 2018"),
+    (43, 55, "FIFA World Cup 1990"),
+    (43, 54, "FIFA World Cup 1986"),
+    (43, 51, "FIFA World Cup 1974"),
+    (43, 272, "FIFA World Cup 1970"),
+    (43, 270, "FIFA World Cup 1962"),
+    (43, 269, "FIFA World Cup 1958"),
+    (55, 282, "UEFA Euro 2024"),
+    (55, 43, "UEFA Euro 2020"),
+    (223, 282, "Copa America 2024"),
+    (1267, 107, "Africa Cup of Nations 2023"),
+    (72, 107, "Women's World Cup 2023"),
+    (72, 30, "Women's World Cup 2019"),
+    (53, 315, "UEFA Women's Euro 2025"),
+    (53, 106, "UEFA Women's Euro 2022"),
+)
+
+_TEAM_STAT_COLUMNS = (
+    "xg",
+    "shots",
+    "shots_on_target",
+    "corners",
+    "yellow_cards",
+    "red_cards",
+    "pressing_intensity",
+)
 
 
 class StatsBombOpenDataSource(BaseDataSource):
@@ -126,6 +165,54 @@ class StatsBombOpenDataSource(BaseDataSource):
         )
         return statistics
 
+    def build_wide_matches_frame(self, competition_id: int, season_id: int) -> pd.DataFrame:
+        """Build a wide matches frame with real per-match stats for one competition/season.
+
+        Reuses `fetch_matches`/`normalize_matches` for match identity and
+        `fetch_events`/`aggregate_team_statistics` for the stats -- the only
+        new logic here is pivoting the per-team stats onto the match row as
+        `home_*`/`away_*` columns, matching the wide `matches` schema
+        `features.builder.build_features` expects.
+        """
+        matches = self.fetch_matches(competition_id, season_id)
+        normalized = self.normalize_matches(matches)
+        stat_rows: list[dict[str, Any]] = []
+        for row in normalized.to_dict(orient="records"):
+            stat_row: dict[str, Any] = {"external_id": row["external_id"]}
+            events = self.fetch_events(int(row["external_id"]))
+            team_statistics = self.aggregate_team_statistics(events)
+            for _, team_row in team_statistics.iterrows():
+                is_home = team_row["team_name"] == row["home_team_name"]
+                prefix = "home_" if is_home else "away_"
+                for column in _TEAM_STAT_COLUMNS:
+                    stat_row[f"{prefix}{column}"] = team_row.get(column)
+            stat_rows.append(stat_row)
+        stats_frame = pd.DataFrame(stat_rows)
+        if stats_frame.empty:
+            return normalized
+        return normalized.merge(stats_frame, on="external_id", how="left")
+
+    def build_all_international_matches(self) -> pd.DataFrame:
+        """Build a combined wide matches frame across every curated international competition.
+
+        A competition that fails to fetch (network hiccup, StatsBomb layout
+        change) is logged and skipped rather than aborting the whole batch --
+        this is an offline enrichment job, not a user-facing request, so a
+        partial result is far more useful than none at all.
+        """
+        frames: list[pd.DataFrame] = []
+        for competition_id, season_id, label in INTERNATIONAL_COMPETITIONS:
+            LOGGER.info(
+                "Fetching %s (competition_id=%s, season_id=%s)", label, competition_id, season_id
+            )
+            try:
+                frames.append(self.build_wide_matches_frame(competition_id, season_id))
+            except Exception:
+                LOGGER.warning("Failed to build matches for %s", label, exc_info=True)
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True).sort_values("match_date").reset_index(drop=True)
+
     def ingest_matches_to_database(
         self,
         session: Session,
@@ -191,5 +278,27 @@ class StatsBombOpenDataSource(BaseDataSource):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Fetch StatsBomb Open Data for international competitions.")
+    parser.add_argument(
+        "--mode",
+        choices=("competitions", "enrich"),
+        default="competitions",
+        help="List available competitions, or build an enriched international matches file.",
+    )
+    parser.add_argument(
+        "--output-path",
+        default=None,
+        help="Where to write the enriched matches file (parquet/csv/json). Required for --mode enrich.",
+    )
+    arguments = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     source = StatsBombOpenDataSource()
-    print(source.fetch_competitions()[:3])
+    if arguments.mode == "competitions":
+        print(source.fetch_competitions()[:3])
+    else:
+        if not arguments.output_path:
+            raise ValueError("--output-path is required when --mode enrich is used.")
+        enriched_matches = source.build_all_international_matches()
+        write_table(enriched_matches, arguments.output_path)
+        print(f"Wrote {len(enriched_matches)} enriched international matches to {arguments.output_path}.")
