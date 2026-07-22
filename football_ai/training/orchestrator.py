@@ -5,9 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+import argparse
+import logging
+
 import pandas as pd
 import numpy as np
 
+from football_ai.config.settings import get_settings
+from football_ai.data.cleaning import clean_matches
+from football_ai.data.io import read_table
 from football_ai.evaluation.metrics import evaluate_predictions
 from football_ai.evaluation.plots import (
     plot_calibration_curve,
@@ -18,6 +24,7 @@ from football_ai.evaluation.plots import (
     plot_roc_curve,
 )
 from football_ai.evaluation.shap_values import save_shap_summary_plot
+from football_ai.features.builder import build_features
 from football_ai.models.base import BaseModelWrapper, CLASSIFICATION_TASKS
 from football_ai.models.catboost_model import CatBoostModel
 from football_ai.models.lightgbm_model import LightGBMModel
@@ -26,9 +33,11 @@ from football_ai.models.random_forest_model import RandomForestModel
 from football_ai.models.registry import ModelRegistry, RegisteredModel
 from football_ai.models.stacking_ensemble import StackingEnsembleModel
 from football_ai.models.xgboost_model import XGBoostModel
-from football_ai.training.datasets import TrainingDataset
+from football_ai.training.datasets import TrainingDataset, build_training_dataset
 from football_ai.training.tuning import tune_model
 
+
+LOGGER = logging.getLogger(__name__)
 
 TARGET_TASK_MAPPING = {
     "match_outcome": "multiclass",
@@ -160,15 +169,23 @@ def _normalize_predictions(
     predictions: object,
     task_type: str,
 ) -> object:
-    """Normalize model predictions to a 1D array when needed."""
+    """Normalize model predictions to a 1D array when needed.
+
+    `CatBoostClassifier.predict()` returns an `(n, 1)` array of the actual
+    predicted labels, not a one-hot/probability matrix -- squeeze that back to
+    1D instead of treating the lone column as class scores via `argmax`, which
+    would silently turn every prediction into class index 0 (this isn't
+    hypothetical: it reproduces on every real `train_target()` run because
+    CatBoost is always one of the four base models).
+    """
     normalized = np.asarray(predictions)
     if task_type not in CLASSIFICATION_TASKS:
         return normalized.ravel() if normalized.ndim > 1 else normalized
     if normalized.ndim == 1:
         return normalized
-    if normalized.ndim == 2:
-        return normalized.argmax(axis=1)
-    raise ValueError(f"Unsupported prediction dimensions: {normalized.ndim}")
+    if normalized.ndim == 2 and normalized.shape[1] == 1:
+        return normalized.ravel()
+    raise ValueError(f"Unsupported prediction dimensions: {normalized.shape}")
 
 
 def train_target(
@@ -352,7 +369,76 @@ def train_target(
     return results
 
 
+def run_training(
+    matches_path: str | Path,
+    version: str = "v1",
+    n_trials: int = 20,
+    target_names: list[str] | None = None,
+) -> list[TrainingResult]:
+    """Load a matches file, build features, and train every requested target.
+
+    A target whose source column isn't present in `matches_path` (a bare
+    historical-results file has no `home_xg`/`home_corners`/etc.) is skipped
+    with a log message instead of letting `build_training_dataset` raise a
+    `KeyError`, since minimal datasets legitimately won't cover every target.
+    """
+    requested_targets = target_names or list(TARGET_TASK_MAPPING)
+    unknown_targets = [name for name in requested_targets if name not in TARGET_TASK_MAPPING]
+    if unknown_targets:
+        raise KeyError(f"Unknown target(s): {', '.join(sorted(unknown_targets))}")
+
+    matches = read_table(matches_path)
+    cleaned_matches, _cleaning_report = clean_matches(matches)
+    feature_result = build_features(cleaned_matches)
+
+    results: list[TrainingResult] = []
+    for target_name in requested_targets:
+        if target_name not in feature_result.targets:
+            LOGGER.warning(
+                "Skipping target '%s': its source column is not present in %s.",
+                target_name,
+                matches_path,
+            )
+            continue
+        dataset = build_training_dataset(feature_result, target_name)
+        target_results = train_target(dataset, target_name, version=version, n_trials=n_trials)
+        results.extend(target_results)
+        best_result = _select_best_result(target_results, TARGET_TASK_MAPPING[target_name])
+        LOGGER.info(
+            "Trained '%s': best model '%s' (test metrics: %s)",
+            target_name,
+            best_result.model_name,
+            best_result.test_metrics,
+        )
+    return results
+
+
 if __name__ == "__main__":
-    print(
-        "Import build_features(...) and build_training_dataset(...), then call train_target(...)."
+    parser = argparse.ArgumentParser(description="Train and register every prediction target.")
+    parser.add_argument(
+        "--matches-path",
+        default=None,
+        help="Path to a wide matches file (parquet/csv/json). Defaults to settings.inference_data_path.",
     )
+    parser.add_argument("--version", default="v1", help="Model version tag to register artifacts under.")
+    parser.add_argument("--n-trials", type=int, default=20, help="Optuna trials per model per target.")
+    parser.add_argument(
+        "--targets",
+        default=None,
+        help="Comma-separated subset of targets to train (default: every target in TARGET_TASK_MAPPING).",
+    )
+    arguments = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    resolved_matches_path = (
+        Path(arguments.matches_path) if arguments.matches_path else get_settings().inference_data_path
+    )
+    resolved_targets = arguments.targets.split(",") if arguments.targets else None
+
+    training_results = run_training(
+        matches_path=resolved_matches_path,
+        version=arguments.version,
+        n_trials=arguments.n_trials,
+        target_names=resolved_targets,
+    )
+    print(f"Trained and registered {len(training_results)} model artifacts.")

@@ -83,5 +83,19 @@ def tune_model(
         return float(sum(scores) / len(scores))
 
     study = optuna.create_study(direction=direction)
-    study.optimize(objective, n_trials=n_trials)
+    # A single trial can legitimately fail (a sampled hyperparameter
+    # combination that a library's internals reject for a specific fold's
+    # data, e.g. CatBoost's own numerical edge cases) without the other
+    # trials being invalid -- `catch` marks that one trial FAILED and keeps
+    # the search going instead of aborting the whole target's tuning.
+    study.optimize(objective, n_trials=n_trials, catch=(Exception,))
+    completed_trials = [
+        trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE
+    ]
+    if not completed_trials:
+        raise RuntimeError(
+            f"All {n_trials} Optuna trial(s) failed while tuning "
+            f"'{model.model_name}' for target '{model.target_name}'; "
+            "see the logged trial errors above for the root cause."
+        )
     return dict(study.best_params)

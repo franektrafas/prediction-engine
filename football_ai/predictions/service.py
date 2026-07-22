@@ -14,6 +14,7 @@ import pandas as pd
 
 from football_ai.config.settings import get_settings
 from football_ai.data.io import read_table
+from football_ai.data.normalization import MATCH_OUTCOME_LABELS
 from football_ai.models.base import TrainedArtifact
 from football_ai.models.registry import ModelRegistry
 from football_ai.predictions.inference_feature_builder import build_inference_feature_frame
@@ -56,11 +57,7 @@ def _probability_spread(probabilities: dict[str, float]) -> float:
 def _canonicalize_class_label(label: object) -> object:
     """Map model-specific class labels into project-level outcome labels."""
     if isinstance(label, (int, float, np.integer, np.floating)) and not isinstance(label, bool):
-        numeric_mapping = {
-            0: "away_win",
-            1: "draw",
-            2: "home_win",
-        }
+        numeric_mapping = dict(enumerate(MATCH_OUTCOME_LABELS))
         integer_label = int(label)
         if float(label) == float(integer_label):
             return numeric_mapping.get(integer_label, label)
@@ -80,6 +77,31 @@ def _canonicalize_class_label(label: object) -> object:
         }
         return string_mapping.get(normalized, normalized)
     return label
+
+
+def _repair_simple_imputer_state(estimator: object) -> None:
+    """Backfill sklearn SimpleImputer internals for reloaded legacy artifacts."""
+    if hasattr(estimator, "named_steps"):
+        for step in estimator.named_steps.values():
+            _repair_simple_imputer_state(step)
+    if hasattr(estimator, "transformers_"):
+        for _, transformer, _ in getattr(estimator, "transformers_", []):
+            _repair_simple_imputer_state(transformer)
+    if hasattr(estimator, "steps"):
+        for _, step in getattr(estimator, "steps", []):
+            _repair_simple_imputer_state(step)
+
+    if estimator.__class__.__name__ != "SimpleImputer":
+        return
+    if hasattr(estimator, "_fill_dtype"):
+        return
+    statistics = getattr(estimator, "statistics_", None)
+    if statistics is None:
+        return
+    try:
+        estimator._fill_dtype = np.asarray(statistics).dtype
+    except Exception:
+        estimator._fill_dtype = np.dtype("float64")
 
 
 @dataclass(slots=True)
@@ -196,7 +218,9 @@ class PredictionService:
 
     def _load_artifact(self, artifact_path: str | Path) -> TrainedArtifact:
         """Load a serialized model artifact."""
-        return joblib.load(Path(artifact_path))
+        artifact = joblib.load(Path(artifact_path))
+        _repair_simple_imputer_state(artifact.estimator)
+        return artifact
 
     def _align_features(
         self,

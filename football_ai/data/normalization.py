@@ -34,3 +34,15 @@ def compute_match_outcome(home_score: int | float, away_score: int | float) -> s
     if home_score < away_score:
         return "away_win"
     return "draw"
+
+
+# Single source of truth for the `match_outcome` label <-> training-code mapping.
+# `features.builder._build_targets` encodes the target with this before fitting
+# (xgboost's sklearn API rejects arbitrary string class labels outright, and
+# every other model in the suite is trained on the same shared target Series),
+# and `predictions.service._canonicalize_class_label` decodes a model's numeric
+# `classes_` back with the same table, so the two ends can't drift apart.
+MATCH_OUTCOME_LABELS: tuple[str, ...] = ("away_win", "draw", "home_win")
+MATCH_OUTCOME_CODES: dict[str, int] = {
+    label: code for code, label in enumerate(MATCH_OUTCOME_LABELS)
+}

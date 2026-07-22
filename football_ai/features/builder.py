@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from football_ai.data.normalization import compute_match_outcome
+from football_ai.data.normalization import MATCH_OUTCOME_CODES, compute_match_outcome
 from football_ai.features.schemas import FeatureBuildResult, FeatureBuilderConfig
 
 
@@ -272,13 +272,34 @@ def _add_relative_features(frame: pd.DataFrame, config: FeatureBuilderConfig) ->
     return engineered
 
 
-def _build_targets(frame: pd.DataFrame) -> dict[str, pd.Series]:
-    """Create model targets from historical results."""
+def _build_targets(frame: pd.DataFrame, source_columns: set[str]) -> dict[str, pd.Series]:
+    """Create model targets from historical results.
+
+    `source_columns` must be the *original* `matches` input's columns, not
+    `frame`'s. `frame` is the post-merge feature frame, where e.g. `home_xg`/
+    `away_shots`/... can exist as an all-zero pass-through column even when
+    the raw stat was never in the source data: those names are also
+    `FeatureBuilderConfig.rolling_metrics` entries, so `build_team_match_frame`
+    always builds a long-frame column for them via `_safe_series`'s
+    zero-filled fallback, and `_wide_merge` only drops a column when it
+    collides with something already in `matches` (`_drop_columns_shadowing_source`)
+    -- a name that was never in `matches` at all doesn't collide with
+    anything and survives. Checking `frame.columns` here would silently turn
+    "this stat was never observed" into a constant, meaningless regression
+    target instead of correctly leaving it out.
+    """
     targets: dict[str, pd.Series] = {}
     if {"home_score", "away_score"}.issubset(frame.columns):
         total_goals = frame["home_score"] + frame["away_score"]
+        # Encoded as int (not the raw "home_win"/"draw"/"away_win" string) because
+        # xgboost's sklearn API rejects arbitrary string class labels on `.fit()`,
+        # and this Series is shared across every model in the training suite --
+        # see `data.normalization.MATCH_OUTCOME_CODES` for the shared mapping that
+        # `predictions.service` decodes back with.
         targets["match_outcome"] = frame.apply(
-            lambda row: compute_match_outcome(row["home_score"], row["away_score"]),
+            lambda row: MATCH_OUTCOME_CODES[
+                compute_match_outcome(row["home_score"], row["away_score"])
+            ],
             axis=1,
         )
         targets["home_goals"] = frame["home_score"]
@@ -301,7 +322,7 @@ def _build_targets(frame: pd.DataFrame) -> dict[str, pd.Series]:
         "home_possession",
         "away_possession",
     ]:
-        if column in frame.columns:
+        if column in source_columns:
             targets[column] = frame[column]
     return targets
 
@@ -372,7 +393,8 @@ def build_features(
     excluded_columns.update(
         f"{side}_{field}" for side in ("home", "away") for field in RAW_MATCH_OUTCOME_FIELDS
     )
-    target_columns = set(_build_targets(feature_frame).keys())
+    source_columns = set(matches.columns)
+    target_columns = set(_build_targets(feature_frame, source_columns).keys())
     numeric_columns = [
         column
         for column in feature_frame.columns
@@ -387,5 +409,5 @@ def build_features(
         feature_columns=feature_columns,
         categorical_columns=categorical_columns,
         numeric_columns=numeric_columns,
-        targets=_build_targets(feature_frame),
+        targets=_build_targets(feature_frame, source_columns),
     )
