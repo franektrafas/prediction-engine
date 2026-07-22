@@ -196,6 +196,31 @@ class TierAFeatureIntegrationTestCase(unittest.TestCase):
         for column in ("home_defense_index_3", "away_defense_index_3", "defense_index_3_diff"):
             self.assertIn(column, self.result.feature_columns)
 
+    def test_injured_market_value_diff_defaults_to_zero_without_source_data(self) -> None:
+        """A historical training file with no injury data shouldn't error -- it's a live-only field.
+
+        Same `_safe_series` zero-fill contract as `lineup_market_value`/
+        `goalkeeper_form`: the column always exists (so `elo_diff`-style
+        `direct_pairs` always finds it), just defaulted to 0.0 when the
+        source has nothing real to report.
+        """
+        self.assertIn("injured_market_value_diff", self.result.feature_columns)
+        self.assertTrue((self.frame["injured_market_value_diff"] == 0.0).all())
+
+
+class InjuredMarketValueFeatureTestCase(unittest.TestCase):
+    """Validate injured_market_value flows through when the live-enriched payload provides it."""
+
+    def test_injured_market_value_diff_computed_when_present(self) -> None:
+        """When home/away_injured_market_value are in the input, the diff feature should appear and be correct."""
+        matches = _alpha_matches()
+        matches["home_injured_market_value"] = 1_000_000.0
+        matches["away_injured_market_value"] = 250_000.0
+        result = build_features(matches)
+        self.assertIn("injured_market_value_diff", result.feature_columns)
+        row = result.frame.iloc[0]
+        self.assertAlmostEqual(row["injured_market_value_diff"], 750_000.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,6 +11,7 @@ from typing import Any
 import pandas as pd
 from bs4 import BeautifulSoup
 
+from football_ai.data.io import write_table
 from football_ai.data.normalization import canonicalize_team_name
 from football_ai.predictions.player_reference_store import (
     PlayerReferenceUpdateResult,
@@ -214,6 +215,117 @@ class TransfermarktSource(BaseDataSource):
             )
         return pd.DataFrame(rows)
 
+    def fetch_national_team_injuries(
+        self,
+        team_id: int,
+        team_slug: str,
+        team_name: str,
+    ) -> pd.DataFrame:
+        """Fetch and parse a national team's current injuries/suspensions.
+
+        Unlike `FootballApiSource.fetch_injuries()`, this needs no
+        `league_id`/`season` and has no free-plan season cutoff -- verified
+        against the real, current page (a July-2026-dated injury showed up
+        for Poland during planning) rather than a stale 2022-2024 snapshot.
+        """
+        html = self.fetch_text_with_headers(
+            f"{self.BASE_URL}/{team_slug}/sperrenundverletzungen/verein/{team_id}",
+            headers=_REQUEST_HEADERS,
+        )
+        return self._parse_injuries_table(html, team_id=team_id, team_name=team_name)
+
+    def _parse_injuries_table(self, html: str, team_id: int, team_name: str) -> pd.DataFrame:
+        """Parse the real injuries/suspensions table structure into player rows.
+
+        Same `table.items > tbody > tr` family as the squad table, but rows
+        are grouped under single-cell category headers (`"Injuries"`,
+        `"Suspension"`, ...) that apply to every player row until the next
+        one -- tracked as `current_category` while walking the table.
+        """
+        soup = BeautifulSoup(html, "lxml")
+        table = soup.select_one("table.items")
+        if table is None:
+            return pd.DataFrame()
+
+        rows: list[dict[str, Any]] = []
+        canonical_team_name = canonicalize_team_name(team_name)
+        current_category: str | None = None
+        for row in table.select("tbody > tr"):
+            cells = row.find_all("td", recursive=False)
+            if len(cells) == 1:
+                current_category = cells[0].get_text(strip=True)
+                continue
+            if len(cells) < 6:
+                continue
+            name_link = cells[0].select_one("td.hauptlink a")
+            if name_link is None:
+                continue
+            player_href = name_link.get("href", "")
+            player_id_match = re.search(r"/spieler/(\d+)", player_href)
+            rows.append(
+                {
+                    "team_name": canonical_team_name,
+                    "team_external_id": team_id,
+                    "player_name": name_link.get_text(strip=True),
+                    "player_external_id": (
+                        int(player_id_match.group(1)) if player_id_match else None
+                    ),
+                    "injury_category": current_category,
+                    "injury_reason": cells[2].get_text(strip=True) or None,
+                    "injury_since": cells[3].get_text(strip=True) or None,
+                    "injury_expected_return": cells[4].get_text(strip=True) or None,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def refresh_injuries(
+        self,
+        team_ids: list[tuple[int, str, str]] | None = None,
+        injuries_path: str | None = None,
+        request_delay_seconds: float = 1.0,
+    ) -> pd.DataFrame:
+        """Fetch current injuries/suspensions for the given teams and replace the injuries store.
+
+        Unlike `refresh_player_reference()`, this **overwrites**
+        `injuries_path` rather than merging -- an injury list is a current
+        snapshot, not an accumulating reference, so a recovered player
+        should disappear on the next refresh instead of being stuck forever
+        the way a null-safe column merge would leave them. As a low-cost
+        bonus, also flags the same players' `injury_risk_score` in the
+        player reference store (a coarser fallback signal if this dedicated
+        store isn't refreshed for some reason) -- that part reuses the
+        existing merge, so it inherits the same graceful degradation.
+        """
+        resolved_path = injuries_path if injuries_path else self.settings.injuries_path
+        teams = team_ids if team_ids is not None else list(NATIONAL_TEAM_IDS)
+        injury_frames: list[pd.DataFrame] = []
+        for index, (team_id, team_slug, team_name) in enumerate(teams):
+            if index > 0 and request_delay_seconds > 0:
+                time.sleep(request_delay_seconds)
+            try:
+                injuries = self.fetch_national_team_injuries(team_id, team_slug, team_name)
+            except Exception:
+                LOGGER.warning("Failed to fetch Transfermarkt injuries for %s", team_name, exc_info=True)
+                continue
+            if not injuries.empty:
+                injury_frames.append(injuries)
+        combined = (
+            pd.concat(injury_frames, ignore_index=True) if injury_frames else pd.DataFrame()
+        )
+        write_table(combined, resolved_path)
+        if not combined.empty:
+            risk_scores = combined[["team_name", "player_name", "player_external_id"]].drop_duplicates()
+            risk_scores["injury_risk_score"] = 1.0
+            try:
+                update_player_reference_store(
+                    self.settings.player_reference_path,
+                    observed_players=risk_scores,
+                    source_name="transfermarkt",
+                )
+            except Exception:
+                LOGGER.warning("Failed to flag injury_risk_score in player reference", exc_info=True)
+        return combined
+
     def refresh_player_reference(
         self,
         team_ids: list[tuple[int, str, str]] | None = None,
@@ -257,9 +369,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fetch Transfermarkt squad data for national teams.")
     parser.add_argument(
         "--mode",
-        choices=("search", "squad", "refresh-all"),
+        choices=("search", "squad", "injuries", "refresh-all", "refresh-injuries-all"),
         default="refresh-all",
-        help="Discover a team's id/slug, fetch one team's squad, or refresh the full curated list.",
+        help=(
+            "Discover a team's id/slug, fetch one team's squad or injuries, or refresh "
+            "the full curated list (squads or injuries)."
+        ),
     )
     parser.add_argument("--query", default=None, help="Team name to search for (search mode).")
     parser.add_argument("--team-id", type=int, default=None, help="Transfermarkt team id (squad mode).")
@@ -282,6 +397,20 @@ if __name__ == "__main__":
         )
         print(f"Fetched {len(squad_frame)} squad rows for {arguments.team_name}.")
         print(squad_frame.head(30).to_string(index=False))
+    elif arguments.mode == "injuries":
+        if not (arguments.team_id and arguments.team_slug and arguments.team_name):
+            raise ValueError("--team-id, --team-slug, and --team-name are required when --mode injuries is used.")
+        injuries_frame = source.fetch_national_team_injuries(
+            arguments.team_id, arguments.team_slug, arguments.team_name
+        )
+        print(f"Fetched {len(injuries_frame)} injury rows for {arguments.team_name}.")
+        print(injuries_frame.head(30).to_string(index=False))
+    elif arguments.mode == "refresh-injuries-all":
+        injuries_result = source.refresh_injuries()
+        print(
+            f"Refreshed injuries from {len(NATIONAL_TEAM_IDS)} national team(s): "
+            f"{len(injuries_result)} current injuries/suspensions in {source.settings.injuries_path}."
+        )
     else:
         result = source.refresh_player_reference()
         print(

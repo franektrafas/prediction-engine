@@ -37,6 +37,7 @@ class AppSettings:
     model_artifact_dir: Path
     inference_data_path: Path
     player_reference_path: Path
+    injuries_path: Path
     football_api_base_url: str
     football_api_key: str
     football_api_host: str
@@ -76,12 +77,19 @@ def get_settings() -> AppSettings:
             str(project_root / "data" / "processed" / "player_reference.parquet"),
         )
     )
+    injuries_path = Path(
+        _read_env(
+            "INJURIES_PATH",
+            str(project_root / "data" / "processed" / "injuries.parquet"),
+        )
+    )
     return AppSettings(
         database=database,
         project_root=project_root,
         model_artifact_dir=model_artifact_dir,
         inference_data_path=inference_data_path,
         player_reference_path=player_reference_path,
+        injuries_path=injuries_path,
         football_api_base_url=_read_env(
             "FOOTBALL_API_BASE_URL",
             "https://v3.football.api-sports.io",

@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+import pandas as pd
+
 from football_ai.scrapers.sources.transfermarkt import (
     TransfermarktSource,
     _parse_age,
@@ -72,6 +74,52 @@ _SEARCH_RESULTS_HTML = """
 </div>
 """
 
+# A trimmed, structurally-accurate copy of the real "sperrenundverletzungen"
+# (suspensions and injuries) page markup (verified against Transfermarkt's
+# live Poland page during planning -- a real, current injury showed up).
+# Player rows are grouped under single-cell category header rows that apply
+# until the next one.
+_INJURIES_TABLE_HTML = """
+<table class="items">
+<tbody>
+<tr><td class="extrarow bg_blau_20 hauptlink" colspan="6">Injuries</td></tr>
+<tr class="odd">
+<td>
+<table class="inline-table">
+<tr>
+<td rowspan="2"><img alt="Filip Rozga" title="Filip Rozga"/></td>
+<td class="hauptlink"><a href="/filip-rozga/profil/spieler/974365" title="Filip Rozga">Filip Rozga</a></td>
+</tr>
+<tr><td>Attacking Midfield</td></tr>
+</table>
+</td>
+<td class="zentriert">19</td>
+<td class="links hauptlink img-vat">Muscle injury</td>
+<td class="zentriert">04/07/2026</td>
+<td class="zentriert"></td>
+<td class="zentriert"><a href="/polen/spielplandatum/verein/3442">1</a></td>
+</tr>
+<tr><td class="extrarow bg_blau_20 hauptlink" colspan="6">Suspension</td></tr>
+<tr class="odd">
+<td>
+<table class="inline-table">
+<tr>
+<td rowspan="2"><img alt="Jakub Kaminski" title="Jakub Kaminski"/></td>
+<td class="hauptlink"><a href="/jakub-kaminski/profil/spieler/582495" title="Jakub Kaminski">Jakub Kaminski</a></td>
+</tr>
+<tr><td>Right Winger</td></tr>
+</table>
+</td>
+<td class="zentriert">23</td>
+<td class="links hauptlink img-vat">Red card</td>
+<td class="zentriert">10/07/2026</td>
+<td class="zentriert">15/07/2026</td>
+<td class="zentriert"><a href="/polen/spielplandatum/verein/3442">2</a></td>
+</tr>
+</tbody>
+</table>
+"""
+
 
 class MarketValueAndAgeParsingTestCase(unittest.TestCase):
     """Validate the small text parsers in isolation."""
@@ -133,6 +181,83 @@ class TransfermarktSquadParsingTestCase(unittest.TestCase):
         """HTML without a squad table should return an empty frame, not raise."""
         frame = self.source._parse_squad_table("<html><body>No squad here</body></html>", team_id=1, team_name="Nowhere")
         self.assertTrue(frame.empty)
+
+
+class TransfermarktInjuriesParsingTestCase(unittest.TestCase):
+    """Validate the injuries/suspensions table parser against realistic markup."""
+
+    def setUp(self) -> None:
+        """Create a fresh source instance for each test."""
+        self.source = TransfermarktSource()
+
+    def test_parse_injuries_table_extracts_players_and_category(self) -> None:
+        """Player name/id, category (tracked across header rows), reason, and dates should all parse."""
+        frame = self.source._parse_injuries_table(_INJURIES_TABLE_HTML, team_id=3442, team_name="Poland")
+        self.assertEqual(len(frame), 2)
+
+        injury_row = frame.loc[frame["player_name"] == "Filip Rozga"].iloc[0]
+        self.assertEqual(injury_row["player_external_id"], 974365)
+        self.assertEqual(injury_row["injury_category"], "Injuries")
+        self.assertEqual(injury_row["injury_reason"], "Muscle injury")
+        self.assertEqual(injury_row["injury_since"], "04/07/2026")
+        self.assertTrue(pd.isna(injury_row["injury_expected_return"]))
+        self.assertEqual(injury_row["team_name"], "Poland")
+
+        suspension_row = frame.loc[frame["player_name"] == "Jakub Kaminski"].iloc[0]
+        self.assertEqual(suspension_row["injury_category"], "Suspension")
+        self.assertEqual(suspension_row["injury_reason"], "Red card")
+        self.assertEqual(suspension_row["injury_expected_return"], "15/07/2026")
+
+    def test_parse_injuries_table_handles_missing_table(self) -> None:
+        """HTML without an injuries table should return an empty frame, not raise."""
+        frame = self.source._parse_injuries_table("<html><body>No injuries table</body></html>", team_id=1, team_name="Nowhere")
+        self.assertTrue(frame.empty)
+
+
+class TransfermarktRefreshInjuriesTestCase(unittest.TestCase):
+    """Validate refresh_injuries()'s resilience, mirroring refresh_player_reference()'s tests."""
+
+    def setUp(self) -> None:
+        """Create a fresh source instance for each test."""
+        self.source = TransfermarktSource()
+
+    def test_skips_a_failing_team(self) -> None:
+        """One team's fetch failing should not stop the others from being stored."""
+        good_injuries = self.source._parse_injuries_table(_INJURIES_TABLE_HTML, team_id=3442, team_name="Poland")
+
+        def fetch_side_effect(team_id, team_slug, team_name):
+            if team_name == "France":
+                raise RuntimeError("blocked")
+            return good_injuries
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            injuries_path = Path(temp_dir) / "injuries.csv"
+            reference_path = Path(temp_dir) / "player_reference.csv"
+            with (
+                mock.patch.object(self.source, "fetch_national_team_injuries", side_effect=fetch_side_effect),
+                mock.patch.object(self.source.settings, "player_reference_path", reference_path),
+            ):
+                result = self.source.refresh_injuries(
+                    team_ids=[(3442, "polen", "Poland"), (3377, "frankreich", "France")],
+                    injuries_path=str(injuries_path),
+                    request_delay_seconds=0,
+                )
+        self.assertEqual(len(result), 2)
+
+    def test_handles_every_team_failing(self) -> None:
+        """A refresh where every team fails should degrade gracefully, not raise, and still write an empty store."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            injuries_path = Path(temp_dir) / "injuries.csv"
+            with mock.patch.object(
+                self.source, "fetch_national_team_injuries", side_effect=RuntimeError("blocked")
+            ):
+                result = self.source.refresh_injuries(
+                    team_ids=[(3442, "polen", "Poland")],
+                    injuries_path=str(injuries_path),
+                    request_delay_seconds=0,
+                )
+            self.assertEqual(len(result), 0)
+            self.assertTrue(injuries_path.exists())
 
 
 class TransfermarktSearchTestCase(unittest.TestCase):

@@ -80,6 +80,8 @@ def payload_to_match_row(payload: MatchContextPayload) -> dict[str, object]:
         "away_forward_form": payload.away_forward_form or 0.0,
         "home_travel_distance_km": payload.home_travel_distance_km or 0.0,
         "away_travel_distance_km": payload.away_travel_distance_km or 0.0,
+        "home_injured_market_value": payload.home_injured_market_value or 0.0,
+        "away_injured_market_value": payload.away_injured_market_value or 0.0,
         "home_recent_xga": home_recent_xga,
         "away_recent_xga": away_recent_xga,
         "weather_temperature_c": payload.weather_temperature_c or 18.0,

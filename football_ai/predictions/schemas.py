@@ -39,6 +39,8 @@ class MatchContextPayload(BaseModel):
     away_forward_form: float | None = None
     home_travel_distance_km: float | None = None
     away_travel_distance_km: float | None = None
+    home_injured_market_value: float | None = None
+    away_injured_market_value: float | None = None
     home_recent_xg: float | None = None
     away_recent_xg: float | None = None
     home_recent_xga: float | None = None

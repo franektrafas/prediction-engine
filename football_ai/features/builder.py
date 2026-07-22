@@ -65,6 +65,7 @@ def build_team_match_frame(matches: pd.DataFrame) -> pd.DataFrame:
             "goalkeeper_form": _safe_series(match_frame, "home_goalkeeper_form"),
             "forward_form": _safe_series(match_frame, "home_forward_form"),
             "travel_distance_km": _safe_series(match_frame, "home_travel_distance_km"),
+            "injured_market_value": _safe_series(match_frame, "home_injured_market_value"),
         }
     )
 
@@ -91,6 +92,7 @@ def build_team_match_frame(matches: pd.DataFrame) -> pd.DataFrame:
             "goalkeeper_form": _safe_series(match_frame, "away_goalkeeper_form"),
             "forward_form": _safe_series(match_frame, "away_forward_form"),
             "travel_distance_km": _safe_series(match_frame, "away_travel_distance_km"),
+            "injured_market_value": _safe_series(match_frame, "away_injured_market_value"),
         }
     )
 
@@ -355,6 +357,7 @@ def _add_relative_features(frame: pd.DataFrame, config: FeatureBuilderConfig) ->
         ("home_rest_days", "away_rest_days", "rest_days_diff"),
         ("home_matches_last_30_days", "away_matches_last_30_days", "recent_load_diff"),
         ("home_travel_distance_km", "away_travel_distance_km", "travel_distance_diff"),
+        ("home_injured_market_value", "away_injured_market_value", "injured_market_value_diff"),
         ("home_win_streak", "away_win_streak", "win_streak_diff"),
         ("home_loss_streak", "away_loss_streak", "loss_streak_diff"),
         ("home_form_trend", "away_form_trend", "form_trend_diff"),
