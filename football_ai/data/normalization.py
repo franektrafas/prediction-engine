@@ -3,16 +3,25 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 
 from football_ai.config.team_aliases import TEAM_ALIASES
 
 
 def normalize_text(value: object | None) -> str:
-    """Normalize a text field for canonical matching."""
+    """Normalize a text field for canonical matching.
+
+    Strips diacritics (`unicodedata` NFKD decomposition) before lowercasing --
+    without this, "Côte d'Ivoire" (StatsBomb's spelling) and the "cote
+    d'ivoire" alias key in `config.team_aliases` never match, since they
+    differ only in the accented "o". The same gap affects player names
+    (e.g. "Rózga") when matching across sources that do/don't use accents.
+    """
     if value is None:
         return ""
     if not isinstance(value, str):
         value = str(value)
+    value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
     collapsed = re.sub(r"\s+", " ", value.strip().lower())
     return collapsed
 

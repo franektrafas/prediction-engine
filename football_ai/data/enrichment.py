@@ -24,6 +24,13 @@ def merge_advanced_stats(base_matches: pd.DataFrame, supplemental_matches: pd.Da
     `config.team_aliases`). Not specific to any one source -- reusable for
     any future supplemental frame (StatsBomb, FBref, ...) with the same wide
     `home_*`/`away_*` column convention `features.builder` expects.
+
+    Also matches with home/away swapped: sources disagree on which side of a
+    neutral-venue match counts as "home" (verified in real data -- StatsBomb
+    has 2018 World Cup Uruguay v Russia as Uruguay-home, the base file has it
+    Russia-home). A supplemental row that doesn't match the base's own
+    home/away order still merges, with its `home_*`/`away_*` stat columns
+    swapped to match the base's orientation.
     """
     if base_matches.empty or supplemental_matches.empty:
         return base_matches.copy()
@@ -47,8 +54,20 @@ def merge_advanced_stats(base_matches: pd.DataFrame, supplemental_matches: pd.Da
         subset=list(_MERGE_KEY_COLUMNS), keep="last"
     )
 
+    swapped_slice = supplemental_slice.rename(
+        columns={"_merge_home_team": "_merge_away_team", "_merge_away_team": "_merge_home_team"}
+        | {
+            column: ("away_" + column[len("home_"):] if column.startswith("home_") else "home_" + column[len("away_"):])
+            for column in supplemental_stat_columns
+            if column.startswith("home_") or column.startswith("away_")
+        }
+    )
+    candidate_slice = pd.concat([supplemental_slice, swapped_slice], ignore_index=True).drop_duplicates(
+        subset=list(_MERGE_KEY_COLUMNS), keep="first"
+    )
+
     merged = base.merge(
-        supplemental_slice,
+        candidate_slice,
         on=list(_MERGE_KEY_COLUMNS),
         how="left",
         suffixes=("", "_supplemental"),
@@ -63,4 +82,8 @@ def merge_advanced_stats(base_matches: pd.DataFrame, supplemental_matches: pd.Da
             merged[column] = merged[supplemental_column]
         merged = merged.drop(columns=[supplemental_column])
 
-    return merged.drop(columns=list(_MERGE_KEY_COLUMNS))
+    # Only drop the synthetic team-key helper columns -- match_date is also a
+    # merge key but is a real output column too (unlike the `_merge_*` pair),
+    # so dropping the whole _MERGE_KEY_COLUMNS tuple here would silently strip
+    # match_date from every caller's result.
+    return merged.drop(columns=["_merge_home_team", "_merge_away_team"])

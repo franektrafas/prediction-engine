@@ -71,6 +71,58 @@ class MergeAdvancedStatsTestCase(unittest.TestCase):
         self.assertEqual(merged.iloc[0]["home_score"], 3)
         self.assertEqual(merged.iloc[0]["away_score"], 3)
 
+    def test_matches_across_accented_team_names(self) -> None:
+        """A diacritic-only spelling difference must still resolve to the same alias."""
+        base = pd.DataFrame(
+            [{"match_date": "2024-01-13", "home_team_name": "Ivory Coast", "away_team_name": "Guinea-Bissau",
+              "home_score": 2, "away_score": 0}]
+        )
+        supplemental = pd.DataFrame(
+            [{"match_date": "2024-01-13", "home_team_name": "Côte d'Ivoire", "away_team_name": "Guinea-Bissau",
+              "home_score": 2, "away_score": 0, "home_shots": 15}]
+        )
+        merged = merge_advanced_stats(base, supplemental)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged.iloc[0]["home_shots"], 15)
+
+    def test_matches_with_home_and_away_swapped_between_sources(self) -> None:
+        """A neutral-venue match where sources disagree on which side is 'home' must still merge."""
+        base = pd.DataFrame(
+            [{"match_date": "2018-06-25", "home_team_name": "Russia", "away_team_name": "Uruguay",
+              "home_score": 0, "away_score": 3}]
+        )
+        supplemental = pd.DataFrame(
+            [{"match_date": "2018-06-25", "home_team_name": "Uruguay", "away_team_name": "Russia",
+              "home_score": 3, "away_score": 0, "home_xg": 2.4, "away_xg": 0.6}]
+        )
+        merged = merge_advanced_stats(base, supplemental)
+        self.assertEqual(len(merged), 1)
+        # Base's own home/away orientation (Russia home) wins -- the supplemental
+        # source's home_xg (Uruguay's, since it called Uruguay "home") lands on
+        # away_xg here instead, matching the base's team-to-side assignment.
+        self.assertAlmostEqual(merged.iloc[0]["away_xg"], 2.4)
+        self.assertAlmostEqual(merged.iloc[0]["home_xg"], 0.6)
+
+    def test_match_date_survives_in_the_merged_result(self) -> None:
+        """match_date is a merge key AND a real output column -- it must not get dropped.
+
+        Regression test: the merge-key cleanup at the end of the function used
+        to drop the whole key tuple (including match_date), silently stripping
+        it from every caller's result -- invisible here since no earlier test
+        asserted on it, but fatal downstream since build_features requires it.
+        """
+        base = pd.DataFrame(
+            [{"match_date": "2022-12-18", "home_team_name": "Argentina", "away_team_name": "France",
+              "home_score": 3, "away_score": 3}]
+        )
+        supplemental = pd.DataFrame(
+            [{"match_date": "2022-12-18", "home_team_name": "Argentina", "away_team_name": "France",
+              "home_score": 3, "away_score": 3, "home_xg": 2.1}]
+        )
+        merged = merge_advanced_stats(base, supplemental)
+        self.assertIn("match_date", merged.columns)
+        self.assertFalse(pd.isna(merged.iloc[0]["match_date"]))
+
     def test_empty_supplemental_frame_returns_base_unchanged(self) -> None:
         """An empty supplemental frame should be a safe no-op."""
         base = pd.DataFrame(
