@@ -208,6 +208,34 @@ class TierAFeatureIntegrationTestCase(unittest.TestCase):
         self.assertTrue((self.frame["injured_market_value_diff"] == 0.0).all())
 
 
+class SupplementalMetadataLeakTestCase(unittest.TestCase):
+    """Regression test for the real StatsBomb-merge leak found while retraining.
+
+    With stadium_name/competition_id/etc. merged in unguarded, match_outcome
+    hit ~0.9997 validation F1 on real data -- near-perfect on a 3-class task
+    is a leak, not a good model. These columns are identity/administrative
+    metadata from `data.enrichment.merge_advanced_stats`, never meant to be
+    predictive features.
+    """
+
+    def test_supplemental_identity_columns_never_become_features(self) -> None:
+        """external_id/source/competition_id/etc. must never appear in feature_columns."""
+        matches = _alpha_matches()
+        matches["external_id"] = range(len(matches))
+        matches["source"] = "statsbomb"
+        matches["competition_id"] = 43
+        matches["competition_name"] = "FIFA World Cup"
+        matches["season_name"] = "2022"
+        matches["stadium_name"] = "Estadio Lusail"
+        matches["referee"] = "Some Referee"
+        result = build_features(matches)
+        for column in (
+            "external_id", "source", "competition_id", "competition_name",
+            "season_name", "stadium_name", "referee",
+        ):
+            self.assertNotIn(column, result.feature_columns)
+
+
 class InjuredMarketValueFeatureTestCase(unittest.TestCase):
     """Validate injured_market_value flows through when the live-enriched payload provides it."""
 

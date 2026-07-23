@@ -560,7 +560,7 @@ def build_features(
 
     categorical_columns = [
         column
-        for column in ["tournament", "stadium_name", "country", "home_team_name", "away_team_name"]
+        for column in ["tournament", "country", "home_team_name", "away_team_name"]
         if column in feature_frame.columns
     ]
     excluded_columns = set(
@@ -574,6 +574,33 @@ def build_features(
             "away_match_id",
             "home_match_date",
             "away_match_date",
+            # Identity/administrative metadata a supplemental source (e.g.
+            # StatsBomb via data.enrichment.merge_advanced_stats) attaches
+            # alongside its real stat columns -- not intended as predictive
+            # signal. Confirmed as a real leak vector: with these merged in,
+            # match_outcome hit ~0.9997 validation F1 (near-perfect on a
+            # 3-class task is a leak, not a good model) -- CatBoost's native
+            # categorical handling on "stadium_name" (285/25434 rows non-null,
+            # ~200 distinct values) is the leading suspect, and the plain
+            # numeric "competition_id" doubles as a near-unique tournament
+            # identifier for the same sparse row set. Excluded wholesale
+            # rather than guessing which one leaks -- none of these carry
+            # genuine match-outcome signal a model should be learning from.
+            "external_id",
+            "source",
+            "competition_id",
+            "competition_name",
+            "season_name",
+            "stadium_name",
+            "referee",
+            # The base `matches` frame's own pre-computed total, present in
+            # both the Kaggle-style historical file and the real-data smoke
+            # test that caught this -- not a `TARGET_TASK_MAPPING` name
+            # itself (unlike "btts"/"over_2_5"/...), so `target_columns`
+            # below never catches it. It doesn't fully determine
+            # match_outcome alone, but is a severe partial leak (total goals
+            # scored, known only after kickoff).
+            "total_goals",
         ]
     )
     # Raw per-match outcome statistics (as opposed to their rolling/historical
@@ -585,8 +612,23 @@ def build_features(
     # would flow straight into `numeric_columns` as a feature and leak the
     # match outcome into its own prediction. Exclude the full raw-stat family
     # explicitly rather than relying on the target list to happen to cover it.
+    #
+    # CONFIRMED REAL, SEVERE LEAK (found training on real data for the first
+    # time ever, this session): `build_team_match_frame` names the raw
+    # per-team goal columns "goals_for"/"goals_against" (see lines ~51-52,
+    # 78-79), not "goals" -- so the "goals" entry that was here never matched
+    # `home_goals_for`/`home_goals_against` at all. Those are literally this
+    # match's own final score, wide-merged in unguarded; a real training run
+    # picked them up as the single most important features by two orders of
+    # magnitude (LightGBM/CatBoost/XGBoost all hit 100% test accuracy on
+    # match_outcome). This bug predates this session entirely -- it's been
+    # live since `goals_for`/`goals_against` were introduced -- but nothing
+    # ever ran `run_training()` against real full-scale data to surface it
+    # until now; the small synthetic fixtures in the test suite never
+    # asserted on accuracy values, only that training completed.
     RAW_MATCH_OUTCOME_FIELDS = (
-        "goals",
+        "goals_for",
+        "goals_against",
         "xg",
         "xga",
         "possession_pct",
