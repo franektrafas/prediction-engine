@@ -363,7 +363,16 @@ def train_target(
             task_type=task_type,
             version=version,
             artifact_path=str(best_result.artifact_path),
-            metrics=best_result.validation_metrics,
+            # test_metrics, not validation_metrics -- every other entry in the
+            # registry (per-model, including this same model under its own
+            # name) reports test-set metrics. Registering "selected_model"
+            # with validation metrics instead made the one entry
+            # `PredictionService` actually serves report a different,
+            # typically inflated number than its own per-model twin --
+            # caught comparing a real local run's registry entries side by
+            # side (stacking_ensemble: 0.49 test accuracy vs selected_model,
+            # same run, same model: 0.74).
+            metrics=best_result.test_metrics,
         )
     )
     return results
@@ -389,6 +398,14 @@ def run_training(
 
     matches = read_table(matches_path)
     cleaned_matches, _cleaning_report = clean_matches(matches)
+    # clean_matches only requires match_date/home_team_name/away_team_name, so a
+    # scheduled-but-unplayed fixture (NaN score) survives it -- unlike inference,
+    # which deliberately appends one such row to predict, training must never see
+    # one: it would otherwise pick up whatever placeholder outcome label the source
+    # file assigned to an unplayed match as if it were a real result.
+    score_columns = [c for c in ("home_score", "away_score") if c in cleaned_matches.columns]
+    if score_columns:
+        cleaned_matches = cleaned_matches.dropna(subset=score_columns)
     feature_result = build_features(cleaned_matches)
 
     results: list[TrainingResult] = []

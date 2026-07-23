@@ -109,6 +109,20 @@ class TrainingOrchestratorCliTestCase(unittest.TestCase):
             self.assertEqual(entry.model_name, "selected_model")
             self.assertTrue(Path(entry.artifact_path).exists())
 
+            # Regression test: "selected_model" must report the winning
+            # model's *test*-set metrics, matching every other registry
+            # entry -- it used to report validation-set metrics instead,
+            # so the one entry PredictionService actually serves showed a
+            # different (typically inflated) number than its own per-model
+            # twin in the same run.
+            matching_result = next(
+                result
+                for result in results
+                if result.target_name == target_name
+                and str(result.artifact_path) == entry.artifact_path
+            )
+            self.assertEqual(entry.metrics, matching_result.test_metrics)
+
     def test_run_training_skips_targets_missing_from_reduced_input(self) -> None:
         """Targets whose source column is absent should be skipped, not raise."""
         matches_path = Path(self.artifact_dir) / "matches_reduced.csv"
