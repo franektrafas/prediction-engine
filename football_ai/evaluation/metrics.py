@@ -40,6 +40,17 @@ def evaluate_predictions(
                 metrics["brier_score"] = float(
                     sklearn_metrics.brier_score_loss(target, positive_probabilities)
                 )
+            elif task_type == "multiclass":
+                # sklearn's brier_score_loss is binary-only -- this is the standard
+                # multiclass generalization (mean squared error between the predicted
+                # probability vector and the one-hot true label, averaged over both
+                # samples and classes), used the same way here to judge calibration
+                # quality (a well-calibrated model's Brier score should drop, even
+                # when accuracy/F1 barely move -- those only look at the argmax).
+                probabilities_array = np.asarray(probabilities)
+                classes = np.unique(target)
+                one_hot = (target.to_numpy()[:, None] == classes[None, :]).astype(float)
+                metrics["brier_score"] = float(np.mean(np.sum((probabilities_array - one_hot) ** 2, axis=1)))
     else:
         metrics["mae"] = float(sklearn_metrics.mean_absolute_error(target, predictions))
         metrics["rmse"] = float(

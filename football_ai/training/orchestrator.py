@@ -25,7 +25,7 @@ from football_ai.evaluation.plots import (
 )
 from football_ai.evaluation.shap_values import save_shap_summary_plot
 from football_ai.features.builder import build_features
-from football_ai.models.base import BaseModelWrapper, CLASSIFICATION_TASKS
+from football_ai.models.base import BaseModelWrapper, CLASSIFICATION_TASKS, _require_dependency
 from football_ai.models.catboost_model import CatBoostModel
 from football_ai.models.lightgbm_model import LightGBMModel
 from football_ai.models.logistic_regression_model import LogisticRegressionModel
@@ -188,6 +188,63 @@ def _normalize_predictions(
     raise ValueError(f"Unsupported prediction dimensions: {normalized.shape}")
 
 
+def _calibrate_on_validation(model: BaseModelWrapper, dataset: TrainingDataset) -> None:
+    """Calibrate a fitted classifier's probabilities using held-out validation data.
+
+    `evaluation/plots.py` already had `plot_calibration_curve` for *diagnosing*
+    miscalibration, but nothing upstream of it ever actually calibrated
+    anything served -- good accuracy with badly-calibrated probabilities is
+    invisible to accuracy/F1, but is exactly what matters for any
+    probability-consuming use (betting-edge evaluation, "68% chance" framing
+    for media). Platt scaling (`method="sigmoid"`), not isotonic -- isotonic
+    needs more data per class to avoid overfitting than this project's
+    chronological validation splits reliably provide; sigmoid is the safer
+    default at this data volume.
+
+    Wraps the already-fitted (train-only) estimator in `FrozenEstimator` so
+    it's never refit here -- `CalibratedClassifierCV(cv="prefit")` was
+    removed in sklearn >=1.6 in favor of this spelling. FrozenEstimator does
+    NOT skip internal cross-validation, though (confirmed by actually
+    running this, not by the docs, which read as if it does): it still runs
+    `cross_val_predict` over the given data to get well-distributed
+    out-of-fold probability estimates for fitting the calibrator, using
+    `self.cv`'s fold count (default 5) -- which raises if any class in the
+    calibration set has fewer members than that. Folds are capped to the
+    validation set's smallest class count; if even 2 folds isn't possible
+    (pathologically small validation splits -- small synthetic test
+    fixtures, not real data), calibration is skipped entirely rather than
+    aborting training, matching this project's established
+    graceful-degradation pattern for anything that can't universally
+    succeed on every possible input.
+
+    Mutates `model.estimator` in place; `model.predict`/`.predict_proba`
+    delegate straight to it (see `models/base.py`), so nothing downstream
+    (saving, serving) needs to know calibration happened at all.
+    """
+    validation_target = dataset.target.iloc[dataset.split_indices.validation_indices]
+    min_class_count = int(validation_target.value_counts().min())
+    if min_class_count < 2:
+        LOGGER.warning(
+            "Skipping calibration for '%s': validation split has a class with only %d "
+            "example(s), too few for even 2-fold cross-validation.",
+            model.target_name,
+            min_class_count,
+        )
+        return
+    sklearn_calibration = _require_dependency("sklearn.calibration")
+    sklearn_frozen = _require_dependency("sklearn.frozen")
+    calibrated = sklearn_calibration.CalibratedClassifierCV(
+        estimator=sklearn_frozen.FrozenEstimator(model.estimator),
+        method="sigmoid",
+        cv=min(5, min_class_count),
+    )
+    calibrated.fit(
+        dataset.features.iloc[dataset.split_indices.validation_indices],
+        validation_target,
+    )
+    model.estimator = calibrated
+
+
 def train_target(
     dataset: TrainingDataset,
     target_name: str,
@@ -239,11 +296,18 @@ def train_target(
             probabilities=validation_probabilities,
         )
 
-        model.fit(
-            dataset.features.iloc[train_validation_indices],
-            dataset.target.iloc[train_validation_indices],
-            categorical_columns=dataset.categorical_columns,
-        )
+        if task_type in CLASSIFICATION_TASKS:
+            # Calibrate on validation instead of refitting on train+validation --
+            # calibration needs data the base estimator has never seen (see
+            # `_calibrate_on_validation`); trades a bit of base-model training
+            # data for genuinely-held-out calibration and an honest test score.
+            _calibrate_on_validation(model, dataset)
+        else:
+            model.fit(
+                dataset.features.iloc[train_validation_indices],
+                dataset.target.iloc[train_validation_indices],
+                categorical_columns=dataset.categorical_columns,
+            )
         test_predictions = model.predict(dataset.features.iloc[dataset.split_indices.test_indices])
         test_predictions = _normalize_predictions(test_predictions, task_type)
         test_probabilities = None
