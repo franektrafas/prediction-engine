@@ -83,6 +83,31 @@ class PredictionServiceTestCase(unittest.TestCase):
             self.assertAlmostEqual(probability_sum, 1.0, places=5)
             self.assertEqual(prediction.model_version, "heuristic_baseline_v0")
 
+    def test_heuristic_prediction_surfaces_match_context_from_payload(self) -> None:
+        """Live-only fields (injury impact, etc.) reach the response as context, not as model input.
+
+        Confirmed at exactly zero importance in real ablation (2026-07-24):
+        no model can learn from these (always zero in historical training
+        data). They're excluded from feature_columns, but a caller-supplied
+        value should still surface on the response so a UI/media consumer
+        can present it alongside the prediction.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = PredictionService(registry=ModelRegistry(Path(temp_dir) / "registry.json"))
+            payload = MatchContextPayload(
+                match_date=datetime(2026, 7, 1, tzinfo=timezone.utc),
+                home_team_name="Spain",
+                away_team_name="Portugal",
+                home_elo=1900,
+                away_elo=1850,
+                home_injured_market_value=42_000_000.0,
+                away_injured_market_value=0.0,
+            )
+            prediction = service.predict(payload)
+            self.assertEqual(prediction.match_context.home_injured_market_value, 42_000_000.0)
+            self.assertEqual(prediction.match_context.away_injured_market_value, 0.0)
+            self.assertIsNone(prediction.match_context.home_goalkeeper_form)
+
     def test_registry_backed_prediction_uses_registered_artifact(self) -> None:
         """A registered classifier artifact should drive API probabilities."""
         with tempfile.TemporaryDirectory() as temp_dir:

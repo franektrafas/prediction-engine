@@ -74,6 +74,31 @@ class ProbabilityPayload(BaseModel):
         return value
 
 
+class MatchContext(BaseModel):
+    """Live, non-learned context surfaced alongside a prediction.
+
+    These fields (injuries, squad market value, goalkeeper/forward form) are
+    always zero-filled in historical training data -- there's no point-in-time
+    historical record for them, only current snapshots -- so no trained model
+    can actually learn a relationship from them (confirmed via feature
+    ablation, 2026-07-24: exactly zero importance). They're excluded from
+    `feature_columns` for that reason. Surfaced here instead as informational
+    context a caller (UI, explainability, media use) can present alongside
+    the prediction -- e.g. "model favors the home team, but note they're
+    missing EUR50m of injured value" -- without implying the model itself
+    weighed it.
+    """
+
+    home_injured_market_value: float | None = None
+    away_injured_market_value: float | None = None
+    home_lineup_market_value: float | None = None
+    away_lineup_market_value: float | None = None
+    home_goalkeeper_form: float | None = None
+    away_goalkeeper_form: float | None = None
+    home_forward_form: float | None = None
+    away_forward_form: float | None = None
+
+
 class PredictionResponse(BaseModel):
     """Prediction response for the REST API."""
 
@@ -93,6 +118,7 @@ class PredictionResponse(BaseModel):
     shots_on_target: dict[str, float]
     xg: dict[str, float]
     possession: dict[str, float]
+    match_context: MatchContext = Field(default_factory=MatchContext)
 
     @field_validator(
         "exact_score",

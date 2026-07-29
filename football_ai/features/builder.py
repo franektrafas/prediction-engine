@@ -601,6 +601,25 @@ def build_features(
             # match_outcome alone, but is a severe partial leak (total goals
             # scored, known only after kickoff).
             "total_goals",
+            # Live-only enrichment fields (lineup market value, goalkeeper/
+            # forward form, injury impact) -- always zero-filled in historical
+            # training data (no point-in-time historical record exists, only
+            # current snapshots), so no model can learn a relationship from
+            # them; confirmed at exactly zero importance in real ablation
+            # (2026-07-24). Excluded from the trainable feature set for
+            # honesty about what the model actually uses -- still fully
+            # computed and surfaced to callers via
+            # `predictions.schemas.MatchContext` / `PredictionResponse.match_context`
+            # as informational context, not as a claimed model input.
+            "home_lineup_market_value",
+            "away_lineup_market_value",
+            "home_goalkeeper_form",
+            "away_goalkeeper_form",
+            "home_forward_form",
+            "away_forward_form",
+            "home_injured_market_value",
+            "away_injured_market_value",
+            "injured_market_value_diff",
         ]
     )
     # Raw per-match outcome statistics (as opposed to their rolling/historical

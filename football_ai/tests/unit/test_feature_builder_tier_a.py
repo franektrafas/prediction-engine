@@ -215,11 +215,15 @@ class TierAFeatureIntegrationTestCase(unittest.TestCase):
         """A historical training file with no injury data shouldn't error -- it's a live-only field.
 
         Same `_safe_series` zero-fill contract as `lineup_market_value`/
-        `goalkeeper_form`: the column always exists (so `elo_diff`-style
-        `direct_pairs` always finds it), just defaulted to 0.0 when the
-        source has nothing real to report.
+        `goalkeeper_form`: the column always exists in the underlying frame
+        (so `elo_diff`-style `direct_pairs` always finds it), defaulted to
+        0.0 when the source has nothing real to report. Excluded from
+        `feature_columns` (2026-07-24, real ablation): always zero in
+        historical training data, so no model can learn from it -- surfaced
+        instead as informational context via
+        `predictions.schemas.MatchContext`, not as a claimed model input.
         """
-        self.assertIn("injured_market_value_diff", self.result.feature_columns)
+        self.assertNotIn("injured_market_value_diff", self.result.feature_columns)
         self.assertTrue((self.frame["injured_market_value_diff"] == 0.0).all())
 
 
@@ -252,15 +256,25 @@ class SupplementalMetadataLeakTestCase(unittest.TestCase):
 
 
 class InjuredMarketValueFeatureTestCase(unittest.TestCase):
-    """Validate injured_market_value flows through when the live-enriched payload provides it."""
+    """Validate injured_market_value flows through the frame but never into feature_columns."""
 
-    def test_injured_market_value_diff_computed_when_present(self) -> None:
-        """When home/away_injured_market_value are in the input, the diff feature should appear and be correct."""
+    def test_injured_market_value_diff_computed_but_excluded_from_features(self) -> None:
+        """The diff is still correctly computed in the frame, but is not a trainable feature.
+
+        Always zero in real historical training data (no point-in-time
+        historical injury record exists), so no model can learn from it --
+        confirmed at exactly zero importance in real ablation (2026-07-24).
+        It's excluded from `feature_columns` for honesty about what the
+        model uses, and surfaced instead via
+        `predictions.schemas.MatchContext` as informational context.
+        """
         matches = _alpha_matches()
         matches["home_injured_market_value"] = 1_000_000.0
         matches["away_injured_market_value"] = 250_000.0
         result = build_features(matches)
-        self.assertIn("injured_market_value_diff", result.feature_columns)
+        self.assertNotIn("injured_market_value_diff", result.feature_columns)
+        self.assertNotIn("home_injured_market_value", result.feature_columns)
+        self.assertNotIn("away_injured_market_value", result.feature_columns)
         row = result.frame.iloc[0]
         self.assertAlmostEqual(row["injured_market_value_diff"], 750_000.0)
 

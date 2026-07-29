@@ -18,7 +18,12 @@ from football_ai.data.normalization import MATCH_OUTCOME_LABELS
 from football_ai.models.base import TrainedArtifact
 from football_ai.models.registry import ModelRegistry
 from football_ai.predictions.inference_feature_builder import build_inference_feature_frame
-from football_ai.predictions.schemas import MatchContextPayload, PredictionResponse, ProbabilityPayload
+from football_ai.predictions.schemas import (
+    MatchContext,
+    MatchContextPayload,
+    PredictionResponse,
+    ProbabilityPayload,
+)
 
 
 def _logistic(value: float) -> float:
@@ -52,6 +57,32 @@ def _probability_spread(probabilities: dict[str, float]) -> float:
     if not values:
         return 0.0
     return max(values) - min(values)
+
+
+_MATCH_CONTEXT_FIELDS = (
+    "home_injured_market_value",
+    "away_injured_market_value",
+    "home_lineup_market_value",
+    "away_lineup_market_value",
+    "home_goalkeeper_form",
+    "away_goalkeeper_form",
+    "home_forward_form",
+    "away_forward_form",
+)
+
+
+def _build_match_context(payload: MatchContextPayload | dict[str, object]) -> MatchContext:
+    """Surface live, non-learned context fields from the payload onto the response.
+
+    Never raises -- a missing/absent field just stays None, matching every
+    other live-enrichment path's graceful-degradation contract in this
+    project.
+    """
+    if isinstance(payload, dict):
+        values = {field: payload.get(field) for field in _MATCH_CONTEXT_FIELDS}
+    else:
+        values = {field: getattr(payload, field, None) for field in _MATCH_CONTEXT_FIELDS}
+    return MatchContext(**values)
 
 
 def _canonicalize_class_label(label: object) -> object:
@@ -207,6 +238,7 @@ class PredictionService:
             shots_on_target={"home": home_shots_on_target, "away": away_shots_on_target},
             xg={"home": home_xg, "away": away_xg},
             possession={"home": home_possession, "away": away_possession},
+            match_context=_build_match_context(payload),
         )
 
     def _build_feature_frame(self, payload: MatchContextPayload) -> pd.DataFrame:
@@ -388,4 +420,5 @@ class PredictionService:
             shots_on_target={"home": 4.9 + elo_diff, "away": 3.7 - elo_diff * 0.8},
             xg={"home": home_goals + 0.2, "away": away_goals + 0.15},
             possession={"home": 52.5 + elo_diff * 6.0, "away": 47.5 - elo_diff * 6.0},
+            match_context=_build_match_context(payload),
         )
