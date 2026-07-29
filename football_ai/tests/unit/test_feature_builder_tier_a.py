@@ -7,6 +7,7 @@ import unittest
 import pandas as pd
 
 from football_ai.features.builder import _match_importance_tier, build_features
+from football_ai.features.schemas import FeatureBuilderConfig
 
 
 def _alpha_matches() -> pd.DataFrame:
@@ -190,11 +191,25 @@ class TierAFeatureIntegrationTestCase(unittest.TestCase):
         self.assertEqual(neutral_row["home_is_tournament_host"], 0.0)
 
     def test_composite_attack_and_defense_indices_present(self) -> None:
-        """The composite indices and their home-away diff should exist and be numeric."""
+        """The composite indices and their home-away diff should exist and be numeric.
+
+        Uses an explicit config with "xg"/"xga" back in rolling_metrics rather
+        than self.result's default one -- real ablation on the enriched dataset
+        (2026-07-24) showed StatsBomb-derived rolling columns (including xg/xga)
+        at ~0% importance given only 1.1% real row coverage, so they were
+        dropped from FeatureBuilderConfig's *default* rolling_metrics. That's a
+        data-coverage call, not a claim the composite-index mechanism is wrong --
+        this test verifies the mechanism itself still works correctly whenever a
+        caller's config does include xg/xga (e.g. once coverage improves).
+        """
+        config = FeatureBuilderConfig(
+            rolling_metrics=FeatureBuilderConfig().rolling_metrics + ("xg", "xga")
+        )
+        result = build_features(_alpha_matches(), config=config)
         for column in ("home_attack_index_3", "away_attack_index_3", "attack_index_3_diff"):
-            self.assertIn(column, self.result.feature_columns)
+            self.assertIn(column, result.feature_columns)
         for column in ("home_defense_index_3", "away_defense_index_3", "defense_index_3_diff"):
-            self.assertIn(column, self.result.feature_columns)
+            self.assertIn(column, result.feature_columns)
 
     def test_injured_market_value_diff_defaults_to_zero_without_source_data(self) -> None:
         """A historical training file with no injury data shouldn't error -- it's a live-only field.

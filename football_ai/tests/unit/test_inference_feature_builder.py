@@ -91,7 +91,15 @@ class InferenceFeatureBuilderTestCase(unittest.TestCase):
         )
         result = build_inference_feature_frame(payload, historical_matches)
         self.assertEqual(len(result.frame), 1)
-        self.assertGreater(len(result.dropped_columns), 0)
+        # xg/xga/shots/corners/cards/possession/pressing_intensity were dropped
+        # from FeatureBuilderConfig's default rolling_metrics entirely
+        # (2026-07-24, see features/schemas.py) once ablation showed them at
+        # ~0% importance given only 1.1% real StatsBomb coverage -- so
+        # _should_drop_inference_column now never finds anything to drop
+        # (dropped_columns is always empty), not because the guard broke, but
+        # because the columns it used to strip are never generated at all
+        # anymore. What actually matters -- no fragile StatsBomb ratio column
+        # survives into the frame served to a model -- still holds.
         self.assertFalse(any(column.endswith("_ratio") and "xg_" in column for column in result.frame.columns))
 
 
