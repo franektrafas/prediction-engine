@@ -259,19 +259,31 @@ class PredictionService:
         frame: pd.DataFrame,
         artifact_path: str | Path,
     ) -> tuple[pd.DataFrame, TrainedArtifact]:
-        """Load an artifact and align inference features to the trained schema."""
+        """Load an artifact and align inference features to the trained schema.
+
+        Missing values are left as NaN, not pre-filled with 0.0/"" --
+        CONFIRMED bug (found 2026-07-30 auditing the engine): every trained
+        artifact is a full sklearn Pipeline with its own SimpleImputer
+        (median for numeric, most_frequent for categorical -- see
+        `models/base.py`'s `build_pipeline()`). Pre-filling with 0.0 before
+        `.predict()` means that imputer never sees a real NaN to act on --
+        the raw 0.0 flows straight to `StandardScaler`, scaled using the
+        training-time mean/std, which for a column like `home_elo_rank`
+        (real median ~78) renders as an extreme, out-of-distribution "best
+        team ever" signal rather than "no data". Letting NaN flow through
+        instead lets the model's own trained imputer handle it as designed
+        -- column routing to the numeric vs. categorical branch is done by
+        name (`ColumnTransformer` against `feature_columns`/
+        `categorical_columns`), not by dtype, so this is safe even for a
+        column that's entirely missing and gets created here as float NaN.
+        """
         loaded_artifact = self._load_artifact(artifact_path)
         aligned = frame.copy()
         for column in loaded_artifact.feature_columns:
             if column not in aligned.columns:
-                aligned[column] = 0.0
+                aligned[column] = np.nan
         aligned = aligned[loaded_artifact.feature_columns].copy()
         aligned = aligned.replace([np.inf, -np.inf], np.nan)
-        for column in aligned.columns:
-            if pd.api.types.is_numeric_dtype(aligned[column]):
-                aligned[column] = aligned[column].fillna(0.0)
-            else:
-                aligned[column] = aligned[column].fillna("")
         return aligned, loaded_artifact
 
     def _predict_classification(
