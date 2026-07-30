@@ -50,6 +50,16 @@ class BaseModelWrapper:
     hyperparameters: dict[str, Any] = field(default_factory=dict)
     version: str = "v1"
     estimator: Any | None = None
+    # Set by `training.orchestrator._calibrate_on_validation` right before it
+    # overwrites `estimator` with a `CalibratedClassifierCV(FrozenEstimator(...))`
+    # wrapper -- kept around so `models.stacking_ensemble`'s out-of-fold
+    # meta-feature construction has a genuinely re-clonable/re-fittable
+    # estimator to work with. `sklearn.base.clone()` on a `FrozenEstimator`
+    # returns the same, still-fitted-on-the-original-split object rather than
+    # a fresh unfitted one (that's the whole point of "frozen"), so cloning
+    # `estimator` itself post-calibration silently defeats per-fold OOF
+    # retraining for every classification target -- see stacking_ensemble.py.
+    pre_calibration_estimator: Any | None = None
     feature_columns: list[str] = field(default_factory=list)
     categorical_columns: list[str] = field(default_factory=list)
     metrics: dict[str, float] = field(default_factory=dict)

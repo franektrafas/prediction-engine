@@ -162,6 +162,28 @@ class StackingEnsembleModel(BaseModelWrapper):
         non-linear-friendly features -- fit on the out-of-fold subset, which
         is smaller than the base models' own training data -- was actively
         hurting the combination it was meant to improve.
+
+        CONFIRMED REAL LEAK, fixed 2026-07-30: for every classification
+        target, `model.estimator` at this point is a
+        `CalibratedClassifierCV(FrozenEstimator(base))` (see
+        `training.orchestrator._calibrate_on_validation`) -- and
+        `sklearn.base.clone()` on a `FrozenEstimator` returns the *same*,
+        already-fitted-on-the-original-split object rather than a fresh
+        unfitted one (that's `FrozenEstimator`'s whole purpose). Cloning
+        `model.estimator` directly meant `clone.fit(...)` below only ever
+        refit the calibration curve, never the base decision function --
+        so any fold whose validation rows overlapped the model's *original*
+        train split (most of them, given the split sizes) produced in-sample,
+        not out-of-fold, base-model outputs, undermining this whole
+        function's reason to exist. Fixed by cloning
+        `pre_calibration_estimator` (the plain, still-clonable pipeline
+        stashed before calibration wrapped it) when available -- a true
+        per-fold refit again. This does mean OOF meta-features are built
+        from *uncalibrated* probabilities while serving later uses the
+        *calibrated* ones (see `predict`/`FittedStackingEstimator`) -- a
+        real, smaller distribution shift the meta-learner's own
+        `StandardScaler` absorbs reasonably well, and a strictly better
+        trade-off than not being out-of-fold at all.
         """
         sklearn_base = _require_dependency("sklearn.base")
         folds = _rolling_folds(len(features))
@@ -183,7 +205,12 @@ class StackingEnsembleModel(BaseModelWrapper):
         oof_base_outputs: list[list[np.ndarray]] = [[] for _ in self.base_models]
         for train_indices, validation_indices in folds:
             for model_index, model in enumerate(self.base_models):
-                clone = sklearn_base.clone(model.estimator)
+                refittable_estimator = (
+                    model.pre_calibration_estimator
+                    if model.pre_calibration_estimator is not None
+                    else model.estimator
+                )
+                clone = sklearn_base.clone(refittable_estimator)
                 clone.fit(features.iloc[train_indices], target.iloc[train_indices])
                 oof_base_outputs[model_index].append(
                     _base_model_outputs(clone, features.iloc[validation_indices], self.task_type)

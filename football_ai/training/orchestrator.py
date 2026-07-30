@@ -233,6 +233,12 @@ def _calibrate_on_validation(model: BaseModelWrapper, dataset: TrainingDataset) 
         return
     sklearn_calibration = _require_dependency("sklearn.calibration")
     sklearn_frozen = _require_dependency("sklearn.frozen")
+    # Stashed before `estimator` gets overwritten -- see `pre_calibration_estimator`'s
+    # docstring in `models/base.py`. Needed by `stacking_ensemble.py`'s
+    # out-of-fold meta-feature construction, which clones+refits a base
+    # model per fold; cloning the *calibrated* (frozen) estimator instead
+    # would silently skip the refit and defeat the whole point of "out-of-fold".
+    model.pre_calibration_estimator = model.estimator
     calibrated = sklearn_calibration.CalibratedClassifierCV(
         estimator=sklearn_frozen.FrozenEstimator(model.estimator),
         method="sigmoid",
