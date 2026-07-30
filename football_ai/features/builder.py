@@ -620,6 +620,18 @@ def build_features(
             "home_injured_market_value",
             "away_injured_market_value",
             "injured_market_value_diff",
+            # Same "always zero-filled historically" story as the block above
+            # (confirmed 2026-07-30: neither `home_lineup_average_age` nor
+            # `home_travel_distance_km` exist as columns anywhere in the real
+            # training source), just missed when that list was written --
+            # documentation-only fix, not a behavior change for tree models
+            # (a constant column carries zero split information either way),
+            # but keeps the exclusion list honestly matching its own claim.
+            "home_lineup_average_age",
+            "away_lineup_average_age",
+            "home_travel_distance_km",
+            "away_travel_distance_km",
+            "travel_distance_diff",
         ]
     )
     # Raw per-match outcome statistics (as opposed to their rolling/historical
@@ -657,6 +669,17 @@ def build_features(
         "corners",
         "yellow_cards",
         "red_cards",
+        # CONFIRMED REAL LEAK, same class as goals_for/goals_against above
+        # (found 2026-07-30 auditing for more of these): `build_team_match_frame`
+        # (lines ~58-59, 85-86) builds a *separate*, differently-named "cards"
+        # column = this match's own yellow_cards + red_cards. "yellow_cards"/
+        # "red_cards" above only cover the raw source columns they're spelled
+        # after -- "cards" is a distinct name that neither this list nor
+        # `_build_targets`'s target-name matching ever caught, so
+        # home_cards/away_cards flowed in unguarded as a near-exact restatement
+        # of the home_yellow_cards/away_yellow_cards regression targets
+        # (red cards are rare, so cards ~= yellow_cards for most rows).
+        "cards",
         "fouls",
         "offsides",
         "passes_completed",

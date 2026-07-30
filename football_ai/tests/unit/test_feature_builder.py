@@ -85,6 +85,41 @@ class FeatureBuilderTestCase(unittest.TestCase):
         } & set(feature_result.feature_columns)
         self.assertFalse(leaked, f"Raw current-match score columns leaked as features: {leaked}")
 
+    def test_raw_current_match_cards_never_becomes_a_feature(self) -> None:
+        """Regression test for a real, severe leak found auditing for more of the goals-leak's class.
+
+        `build_team_match_frame` builds a "cards" column = this match's own
+        `home_yellow_cards + home_red_cards`, wide-merged in as `home_cards`/
+        `away_cards`. `RAW_MATCH_OUTCOME_FIELDS` excluded "yellow_cards"/
+        "red_cards" individually (the raw source column names) but never
+        "cards" (the differently-named engineered column) -- so home_cards/
+        away_cards survived unguarded as a near-exact restatement of the
+        home_yellow_cards/away_yellow_cards regression targets. Confirmed for
+        real, 2026-07-30: corr(home_cards, home_yellow_cards) = 0.977 on the
+        real StatsBomb-enriched training file before this fix. Distinct
+        yellow-card counts per row, same reasoning as the goals-leak test
+        above -- a constant column can't leak anything to correlate against.
+        """
+        matches = pd.DataFrame(
+            [
+                {"match_date": "2024-01-01", "home_team_name": "England", "away_team_name": "France",
+                 "home_score": 2, "away_score": 1, "home_yellow_cards": 1, "away_yellow_cards": 3,
+                 "home_red_cards": 0, "away_red_cards": 0},
+                {"match_date": "2024-01-05", "home_team_name": "England", "away_team_name": "Spain",
+                 "home_score": 0, "away_score": 3, "home_yellow_cards": 4, "away_yellow_cards": 0,
+                 "home_red_cards": 1, "away_red_cards": 0},
+                {"match_date": "2024-01-09", "home_team_name": "England", "away_team_name": "Italy",
+                 "home_score": 1, "away_score": 1, "home_yellow_cards": 2, "away_yellow_cards": 2,
+                 "home_red_cards": 0, "away_red_cards": 1},
+                {"match_date": "2024-01-13", "home_team_name": "England", "away_team_name": "Germany",
+                 "home_score": 4, "away_score": 0, "home_yellow_cards": 0, "away_yellow_cards": 5,
+                 "home_red_cards": 0, "away_red_cards": 1},
+            ]
+        )
+        feature_result = build_features(matches)
+        leaked = {"home_cards", "away_cards"} & set(feature_result.feature_columns)
+        self.assertFalse(leaked, f"Raw current-match cards columns leaked as features: {leaked}")
+
 
 if __name__ == "__main__":
     unittest.main()
