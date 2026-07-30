@@ -10,7 +10,7 @@ from football_ai.data.normalization import canonicalize_team_name
 from football_ai.insights.schemas import Fact
 
 
-def _team_matches(
+def team_matches(
     records_frame: pd.DataFrame,
     team_name: str,
     as_of_date: pd.Timestamp | None = None,
@@ -101,7 +101,7 @@ def win_streak(
     venue: str | None = None,
 ) -> Fact | None:
     """Current consecutive-wins streak, or None if the team didn't win its most recent match."""
-    matches = _team_matches(records_frame, team_name, as_of_date, venue)
+    matches = team_matches(records_frame, team_name, as_of_date, venue)
     return _streak_fact(
         fact_type="win_streak",
         team_name=team_name,
@@ -121,7 +121,7 @@ def unbeaten_streak(
     venue: str | None = None,
 ) -> Fact | None:
     """Current consecutive-without-a-loss streak (wins + draws)."""
-    matches = _team_matches(records_frame, team_name, as_of_date, venue)
+    matches = team_matches(records_frame, team_name, as_of_date, venue)
     return _streak_fact(
         fact_type="unbeaten_streak",
         team_name=team_name,
@@ -141,7 +141,7 @@ def scoreless_streak(
     venue: str | None = None,
 ) -> Fact | None:
     """Current consecutive-matches-without-scoring streak."""
-    matches = _team_matches(records_frame, team_name, as_of_date, venue)
+    matches = team_matches(records_frame, team_name, as_of_date, venue)
     return _streak_fact(
         fact_type="scoreless_streak",
         team_name=team_name,
@@ -161,7 +161,7 @@ def clean_sheet_streak(
     venue: str | None = None,
 ) -> Fact | None:
     """Current consecutive-matches-without-conceding streak."""
-    matches = _team_matches(records_frame, team_name, as_of_date, venue)
+    matches = team_matches(records_frame, team_name, as_of_date, venue)
     return _streak_fact(
         fact_type="clean_sheet_streak",
         team_name=team_name,
