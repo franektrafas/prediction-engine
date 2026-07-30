@@ -31,6 +31,27 @@ class CanonicalizeTeamNameTestCase(unittest.TestCase):
         self.assertEqual(canonicalize_team_name("Côte d'Ivoire"), "Ivory Coast")
         self.assertEqual(canonicalize_team_name("Cote d'Ivoire"), "Ivory Coast")
 
+    def test_west_germany_and_east_germany_resolve_to_distinct_entities(self) -> None:
+        """PLAN_SILNIKA.md's own completion criterion for Krok 1.
+
+        A 1974 West Germany match and a 1974 East Germany ("German DR")
+        match must land in the correct, *distinct* entity -- West Germany
+        aliases forward to today's "Germany" (a continuous federation,
+        martj42/international_results' own results.csv already folds it in
+        this way), but East Germany does not: it has no clean modern
+        successor, so it must stay its own canonical name, never merged
+        into "Germany".
+        """
+        self.assertEqual(canonicalize_team_name("West Germany"), "Germany")
+        self.assertEqual(canonicalize_team_name("German DR"), "German DR")
+        self.assertNotEqual(canonicalize_team_name("German DR"), canonicalize_team_name("Germany"))
+
+    def test_yugoslavia_and_soviet_union_era_aliases(self) -> None:
+        """Soviet Union resolves forward (continuous federation); Yugoslavia does not (no clean successor)."""
+        self.assertEqual(canonicalize_team_name("Soviet Union"), "Russia")
+        self.assertEqual(canonicalize_team_name("Yugoslavia"), "Yugoslavia")
+        self.assertEqual(canonicalize_team_name("FR Yugoslavia"), "Serbia")
+
 
 if __name__ == "__main__":
     unittest.main()

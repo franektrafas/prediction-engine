@@ -31,4 +31,27 @@ TEAM_ALIASES: dict[str, str] = {
     "northern ireland": "Northern Ireland",
     "wales": "Wales",
     "scotland": "Scotland",
+    # Historical entities with a clean, continuous successor -- sourced from
+    # martj42/international_results' former_names.csv (2026-07-24), which
+    # documents renames of a still-continuous federation, plus "west germany"
+    # (not in that file -- martj42's own results.csv already folds West
+    # Germany's matches into "Germany" directly, so it never needed the
+    # alias internally, but other sources might still spell it out).
+    # Deliberately NOT aliased: "german dr" (East Germany) and "yugoslavia"
+    # have no single clean modern successor and stay their own canonical
+    # entities -- attributing e.g. Yugoslavia's records to Serbia would be
+    # wrong, not just imprecise. See football_ai/scrapers/sources/
+    # international_results.py for how this feeds the historical merge.
+    "west germany": "Germany",
+    "dahomey": "Benin",
+    "upper volta": "Burkina Faso",
+    "netherlands antilles": "Curacao",
+    "bohemia": "Czechoslovakia",
+    "bohemia and moravia": "Czechoslovakia",
+    "representation of czechs and slovaks": "Czechoslovakia",
+    "belgian congo": "Congo DR",
+    "congo-leopoldville": "Congo DR",
+    "congo-kinshasa": "Congo DR",
+    "soviet union": "Russia",
+    "fr yugoslavia": "Serbia",
 }
