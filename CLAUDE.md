@@ -2,6 +2,24 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Current work — read this first
+
+The active plan lives in **`PLAN_SILNIKA.md`** (Polish). Read it before starting new work.
+
+Short version: the prediction engine is considered done and is **not** the thing to improve.
+Model tuning, new features, extra leagues and the GNN scaffold are all explicitly paused.
+Current effort goes into the layers *above* the engine — full match history, a
+provenance-carrying facts/records module, Monte Carlo simulation, deterministic narrative,
+and new API surface — built as one complete vertical on international football before being
+replicated to club competitions.
+
+Two traps called out in that plan, repeated here because they are easy to walk into:
+- Full history back to 1872 is for **records only**. Do not feed pre-~1990 matches into
+  model training — the sport's scoring distributions are too different and it will quietly
+  degrade predictions.
+- Simulations must sample **scorelines** (Poisson on predicted goals), not 1X2 classes,
+  because qualification is decided on goal difference.
+
 ## Project
 
 `football_ai` — a modular platform for predicting international football matches (World Cup, Euro,
