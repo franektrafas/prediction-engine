@@ -80,7 +80,16 @@ class InternationalResultsSource(BaseDataSource):
                 "neutral_venue": raw["neutral"].astype(bool),
             }
         )
-        return normalized.sort_values("match_date").reset_index(drop=True)
+        normalized = normalized.sort_values("match_date").reset_index(drop=True)
+        # Assigned here (chronological order, before any merge) rather than left
+        # to a downstream caller -- `insights/` (Krok 2) needs a stable per-match
+        # id for Fact provenance, and merge_advanced_stats' left-merge preserves
+        # base-frame row order, so this survives build_records_frame() intact.
+        # Stable across re-runs as long as martj42 only appends new matches at
+        # the end and doesn't reorder history -- true in practice, not
+        # contractually guaranteed by them.
+        normalized.insert(0, "match_id", normalized.index + 1)
+        return normalized
 
     def build_records_frame(self, elo_source_path: str | Path | None = None) -> pd.DataFrame:
         """Build the full-history records frame: martj42 identity/score + our Elo where it overlaps.

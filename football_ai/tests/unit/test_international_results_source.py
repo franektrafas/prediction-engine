@@ -43,11 +43,13 @@ class InternationalResultsSourceTestCase(unittest.TestCase):
         normalized = self.source.normalize_results(raw)
         self.assertListEqual(
             list(normalized.columns),
-            ["match_date", "home_team_name", "away_team_name", "home_score", "away_score", "tournament", "city", "country", "neutral_venue"],
+            ["match_id", "match_date", "home_team_name", "away_team_name", "home_score", "away_score", "tournament", "city", "country", "neutral_venue"],
         )
         self.assertEqual(len(normalized), 3)
         self.assertTrue(pd.api.types.is_datetime64_any_dtype(normalized["match_date"]))
         self.assertEqual(normalized["neutral_venue"].dtype, bool)
+        self.assertListEqual(sorted(normalized["match_id"].to_list()), [1, 2, 3])
+        self.assertEqual(normalized["match_id"].nunique(), 3)
         # East Germany ("German DR") and West Germany ("Germany") must survive as distinct
         # home_team_name values here -- resolving them is canonicalize_team_name's job at
         # merge/feature-build time, not something normalize_results should collapse early.
