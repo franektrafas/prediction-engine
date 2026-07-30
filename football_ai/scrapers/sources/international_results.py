@@ -26,6 +26,7 @@ import pandas as pd
 
 from football_ai.data.enrichment import merge_advanced_stats
 from football_ai.data.io import read_table, write_table
+from football_ai.data.normalization import canonicalize_team_name
 from football_ai.scrapers.base import BaseDataSource
 
 
@@ -66,12 +67,24 @@ class InternationalResultsSource(BaseDataSource):
         (canonicalized home, canonicalized away, date) -- team-name
         conventions already agree almost everywhere without any extra
         resolution work).
+
+        `home_team_name`/`away_team_name` are canonicalized here, not left
+        for a downstream caller -- CONFIRMED REAL BUG (found 2026-07-30
+        auditing the engine): every `insights/` function (streaks.py,
+        h2h.py, records.py, milestones.py) filters this frame by comparing
+        against a `canonicalize_team_name()`-normalized query name. Left
+        raw, any team whose canonical name differs from martj42's spelling
+        (e.g. "Czech Republic" here vs. this project's canonical "Czechia")
+        silently matched zero rows in every insights/ query -- no error,
+        just empty facts -- reproduced for real: `team_matches(df,
+        "Czechia")` returned 0 rows against 363 real "Czech Republic" rows
+        before this fix.
         """
         normalized = pd.DataFrame(
             {
                 "match_date": pd.to_datetime(raw["date"]),
-                "home_team_name": raw["home_team"],
-                "away_team_name": raw["away_team"],
+                "home_team_name": raw["home_team"].map(canonicalize_team_name),
+                "away_team_name": raw["away_team"].map(canonicalize_team_name),
                 "home_score": raw["home_score"],
                 "away_score": raw["away_score"],
                 "tournament": raw["tournament"],
