@@ -7,6 +7,8 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from football_ai.data.cleaning import clean_matches
+from football_ai.data.normalization import canonicalize_team_name
 from football_ai.features.builder import build_features
 from football_ai.predictions.schemas import MatchContextPayload
 
@@ -32,7 +34,16 @@ class InferenceFeatureBuildResult:
 
 
 def payload_to_match_row(payload: MatchContextPayload) -> dict[str, object]:
-    """Convert API payload into a match-like row compatible with feature generation."""
+    """Convert API payload into a match-like row compatible with feature generation.
+
+    Team names are canonicalized here -- CONFIRMED train/serve skew (found
+    2026-07-30 auditing the engine): `training/orchestrator.py` runs every
+    match through `clean_matches()` (which canonicalizes team names) before
+    `build_features()`, but this function never did, so a caller spelling a
+    team differently than its canonical form (e.g. "Czech Republic" instead
+    of "Czechia") would silently fail to match that team's real rolling
+    history below -- not an error, just quietly empty/wrong form features.
+    """
     home_elo = payload.home_elo or 1500.0
     away_elo = payload.away_elo or 1500.0
     home_recent_xg = payload.home_recent_xg or 1.5
@@ -41,8 +52,8 @@ def payload_to_match_row(payload: MatchContextPayload) -> dict[str, object]:
     away_recent_xga = payload.away_recent_xga or 1.3
     return {
         "match_date": pd.to_datetime(payload.match_date, utc=True),
-        "home_team_name": payload.home_team_name,
-        "away_team_name": payload.away_team_name,
+        "home_team_name": canonicalize_team_name(payload.home_team_name),
+        "away_team_name": canonicalize_team_name(payload.away_team_name),
         "home_score": np.nan,
         "away_score": np.nan,
         "tournament": payload.tournament or "Unknown",
@@ -108,6 +119,13 @@ def build_inference_feature_frame(
     history = historical_matches.copy()
     if "match_date" in history.columns:
         history["match_date"] = pd.to_datetime(history["match_date"], utc=True)
+    # Same cleaning training runs before build_features() (canonicalized team
+    # names + deduped rows) -- CONFIRMED train/serve skew otherwise: raw
+    # duplicate rows would inflate rolling aggregates beyond what the model
+    # was actually trained to expect, and un-canonicalized historical team
+    # names would silently fail to `groupby` with a canonicalized payload
+    # team name (see payload_to_match_row's docstring).
+    history, _ = clean_matches(history)
     payload_match_date = pd.to_datetime(payload.match_date, utc=True)
     history = history.loc[history["match_date"] < payload_match_date].copy()
     combined = pd.concat([history, upcoming_match], ignore_index=True)
