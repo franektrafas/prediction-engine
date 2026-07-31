@@ -19,6 +19,12 @@ _RESULTS_CSV = """date,home_team,away_team,home_score,away_score,tournament,city
 2023-06-17,Poland,Germany,0,1,Friendly,Warsaw,Poland,FALSE
 """
 
+_GOALSCORERS_CSV = """date,home_team,away_team,team,scorer,minute,own_goal,penalty
+1974-06-14,Germany,Chile,Germany,Gerd Muller,20.0,False,False
+2023-06-17,Poland,Germany,Germany,Kai Havertz,55.0,False,True
+1899-01-01,Nowhereland,Somewhereland,Nowhereland,Nobody,10.0,False,False
+"""
+
 
 class InternationalResultsSourceTestCase(unittest.TestCase):
     """Validate fetch/normalize/merge behavior, fully offline."""
@@ -120,6 +126,30 @@ class InternationalResultsSourceTestCase(unittest.TestCase):
         training_frame = self.source.build_training_frame(records_frame, cutoff_year=1990)
         self.assertEqual(len(training_frame), 1)
         self.assertEqual(training_frame.iloc[0]["home_team_name"], "Poland")
+
+    def test_normalize_goalscorers_links_to_the_real_match_id(self) -> None:
+        """Two of three goalscorer rows share a (date, home, away) with results.csv and must get that match's match_id."""
+        results_raw = pd.read_csv(pd.io.common.StringIO(_RESULTS_CSV))
+        records_frame = self.source.normalize_results(results_raw)
+        goalscorers_raw = pd.read_csv(pd.io.common.StringIO(_GOALSCORERS_CSV))
+
+        goalscorers_frame = self.source.normalize_goalscorers(goalscorers_raw, records_frame)
+
+        # The third row (Nowhereland vs Somewhereland, 1899) has no matching result -- dropped, not kept with a null id.
+        self.assertEqual(len(goalscorers_frame), 2)
+        self.assertNotIn("Nobody", goalscorers_frame["scorer"].to_list())
+
+        germany_chile_id = records_frame.loc[
+            (records_frame["home_team_name"] == "Germany") & (records_frame["away_team_name"] == "Chile"),
+            "match_id",
+        ].iloc[0]
+        muller_row = goalscorers_frame.loc[goalscorers_frame["scorer"] == "Gerd Muller"].iloc[0]
+        self.assertEqual(int(muller_row["match_id"]), int(germany_chile_id))
+        self.assertEqual(muller_row["team_name"], "Germany")
+
+        havertz_row = goalscorers_frame.loc[goalscorers_frame["scorer"] == "Kai Havertz"].iloc[0]
+        self.assertTrue(bool(havertz_row["penalty"]))
+        self.assertFalse(bool(havertz_row["own_goal"]))
 
 
 if __name__ == "__main__":

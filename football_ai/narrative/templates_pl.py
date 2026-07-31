@@ -171,6 +171,25 @@ def h2h_never_won(fact: Fact) -> str:
     return f"{nom} {verb} {n} {noun} przeciwko {opponent_dative} bez ani jednego zwycięstwa."
 
 
+def player_goal_milestone(fact: Fact) -> str:
+    """"[Player] ([team]) scored their Nth international goal, against [opponent]."
+
+    Deliberately never declines the player's own name -- unlike country
+    names, Polish surname declension varies unpredictably by ending and
+    origin (native vs. foreign), with no small, hand-verifiable table like
+    `team_names_pl.py`'s possible. The player's name is always the
+    sentence's grammatical subject (nominative, safe), and the team is a
+    parenthetical label rather than a declined possessive ("w kadrze
+    Polski" would need genitive) -- both sidestep needing any new
+    declension machinery.
+    """
+    player = fact.data["player_name"]
+    team = nominative_pl(fact.subject_team)
+    n = fact.data["milestone_number"]
+    opponent_dative = dative_pl(fact.data["opponent"])
+    return f"{player} ({team}) zdobył swój {n}. gol w kadrze narodowej, w meczu przeciwko {opponent_dative}."
+
+
 def h2h_first_win_since(fact: Fact) -> str:
     """"[Team]'s win against [opponent] in year Y was their first since year Z."""
     nom = nominative_pl(fact.subject_team)

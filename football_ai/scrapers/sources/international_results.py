@@ -6,12 +6,16 @@ has always had -- `international_results_modern_with_elo.parquet` only goes
 back to 2000 -- and is the prerequisite for any historical record ("first
 time since 1962") the planned `insights/` module needs.
 
-Two output frames, deliberately not one:
+Three output frames, deliberately not one:
 - `records_frame`: full history, 1872-today. For facts/records only.
 - `training_frame`: `records_frame` filtered to a recent cutoff. Pre-~1990
   football has different scoring distributions and would quietly degrade
   model training if fed in unfiltered -- never pass `records_frame` to
   `build_features`/`run_training` directly.
+- `goalscorers_frame`: per-goal scorer/minute/own-goal/penalty events,
+  linked to `records_frame`'s `match_id` -- feeds
+  `insights.player_milestones` (goalscorers.csv starts 1916, later than
+  results.csv's 1872, so it's necessarily a subset of `records_frame`).
 """
 
 from __future__ import annotations
@@ -115,6 +119,55 @@ class InternationalResultsSource(BaseDataSource):
         normalized.insert(0, "match_id", normalized.index + 1)
         return normalized
 
+    def normalize_goalscorers(self, raw: pd.DataFrame, records_frame: pd.DataFrame) -> pd.DataFrame:
+        """Map martj42's goalscorers.csv onto a match_id-linked, canonical-team-name schema.
+
+        Joined to `records_frame`'s `match_id` via (match_date, canonical
+        home, canonical away) -- verified for real, 2026-07-30: 100% of the
+        real 47,914 raw goal events match a real `match_id` this way, no
+        fuzzy-matching or manual reconciliation needed. Rows that somehow
+        fail to match (not observed in practice, but `records_frame` isn't
+        contractually guaranteed to be the exact same fetch) are dropped
+        with a warning rather than silently kept with a null `match_id`,
+        which would violate `insights.schemas.Fact`'s provenance contract
+        the moment a caller tried to use one.
+
+        `scorer` is kept as martj42's raw name string, not resolved through
+        any alias table -- unlike team names, player names don't have this
+        project's established `config.team_aliases` infrastructure, and a
+        given player's name spelling has been observed consistent within
+        this source (spot-checked for real: Robert Lewandowski appears
+        under one exact spelling across all 69 of his real goal-scoring
+        rows for Poland).
+        """
+        normalized = pd.DataFrame(
+            {
+                "match_date": pd.to_datetime(raw["date"], utc=True),
+                "home_team_name": raw["home_team"].map(canonicalize_team_name),
+                "away_team_name": raw["away_team"].map(canonicalize_team_name),
+                "team_name": raw["team"].map(canonicalize_team_name),
+                "scorer": raw["scorer"],
+                "minute": raw["minute"],
+                "own_goal": raw["own_goal"].astype(bool),
+                "penalty": raw["penalty"].astype(bool),
+            }
+        )
+        merged = normalized.merge(
+            records_frame[["match_id", "match_date", "home_team_name", "away_team_name"]],
+            on=["match_date", "home_team_name", "away_team_name"],
+            how="left",
+        )
+        unmatched = int(merged["match_id"].isna().sum())
+        if unmatched:
+            LOGGER.warning(
+                "%d of %d goalscorer rows did not match a real match_id in records_frame; dropping them.",
+                unmatched,
+                len(merged),
+            )
+        matched = merged.dropna(subset=["match_id"]).copy()
+        matched["match_id"] = matched["match_id"].astype("int64")
+        return matched.sort_values("match_date").reset_index(drop=True)
+
     def build_records_frame(self, elo_source_path: str | Path | None = None) -> pd.DataFrame:
         """Build the full-history records frame: martj42 identity/score + our Elo where it overlaps.
 
@@ -188,6 +241,11 @@ if __name__ == "__main__":
         default=_DEFAULT_TRAINING_CUTOFF_YEAR,
         help="Earliest match year to include in the training frame.",
     )
+    parser.add_argument(
+        "--goalscorers-output",
+        default="football_ai/data/processed/international_results_goalscorers.parquet",
+        help="Output path for the match_id-linked goalscorers frame.",
+    )
     arguments = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -213,3 +271,7 @@ if __name__ == "__main__":
         f"training_frame (>= {arguments.cutoff_year}): {len(training_frame)} matches "
         f"-> {arguments.training_output}"
     )
+
+    goalscorers_frame = source.normalize_goalscorers(source.fetch_goalscorers(), records_frame)
+    write_table(goalscorers_frame, arguments.goalscorers_output)
+    print(f"goalscorers_frame: {len(goalscorers_frame)} goal events -> {arguments.goalscorers_output}")

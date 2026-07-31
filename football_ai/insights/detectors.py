@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from football_ai.insights import h2h, milestones, records, streaks
+from football_ai.insights import h2h, milestones, player_milestones, records, streaks
 from football_ai.insights.schemas import Fact
 
 
@@ -19,8 +19,17 @@ def facts_for_team(
     records_frame: pd.DataFrame,
     team_name: str,
     as_of_date: pd.Timestamp | None = None,
+    goalscorers_frame: pd.DataFrame | None = None,
 ) -> list[Fact]:
-    """Every fact type this package can produce for a single team, unranked."""
+    """Every fact type this package can produce for a single team, unranked.
+
+    `goalscorers_frame` is optional (defaults to `None`, matching this
+    function's pre-existing signature -- deliberately backward compatible,
+    every prior caller keeps working unchanged) -- when given, also scans
+    for player-level goal milestones via `player_milestones`, which needs
+    a match_id-linked goalscorers frame (`InternationalResultsSource.
+    normalize_goalscorers()`), not `records_frame` alone.
+    """
     facts: list[Fact] = []
     facts.extend(streaks.all_current_streaks(records_frame, team_name, as_of_date))
     for fact_fn in (records.biggest_win, records.longest_win_streak_ever, records.longest_unbeaten_streak_ever):
@@ -31,6 +40,8 @@ def facts_for_team(
         fact = fact_fn(records_frame, team_name, as_of_date)
         if fact is not None:
             facts.append(fact)
+    if goalscorers_frame is not None:
+        facts.extend(player_milestones.player_goal_milestones_for_team(goalscorers_frame, team_name, as_of_date))
     return facts
 
 
@@ -40,6 +51,7 @@ def facts_for_match(
     away_team: str,
     as_of_date: pd.Timestamp | None = None,
     top_n: int | None = 10,
+    goalscorers_frame: pd.DataFrame | None = None,
 ) -> list[Fact]:
     """Every fact for both sides of an upcoming/played match, plus head-to-head, ranked by weight.
 
@@ -50,8 +62,8 @@ def facts_for_match(
     fact, unranked-but-sorted; the default of 10 matches this being a
     "don't return everything" ranking layer, not a full dump.
     """
-    facts = facts_for_team(records_frame, home_team, as_of_date)
-    facts.extend(facts_for_team(records_frame, away_team, as_of_date))
+    facts = facts_for_team(records_frame, home_team, as_of_date, goalscorers_frame)
+    facts.extend(facts_for_team(records_frame, away_team, as_of_date, goalscorers_frame))
 
     home_h2h = h2h.first_win_since(records_frame, home_team, away_team, as_of_date)
     if home_h2h is not None:

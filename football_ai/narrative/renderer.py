@@ -20,6 +20,7 @@ _TEMPLATES = {
     "longest_unbeaten_streak_ever": templates_pl.longest_unbeaten_streak_ever,
     "match_count_milestone": templates_pl.match_count_milestone,
     "goal_count_milestone": templates_pl.goal_count_milestone,
+    "player_goal_milestone": templates_pl.player_goal_milestone,
     "h2h_never_won": templates_pl.h2h_never_won,
     "h2h_first_win_since": templates_pl.h2h_first_win_since,
 }

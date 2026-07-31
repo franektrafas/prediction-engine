@@ -127,6 +127,22 @@ class MilestoneTemplateTestCase(unittest.TestCase):
         )
 
 
+class PlayerGoalMilestoneTemplateTestCase(unittest.TestCase):
+    """Real historical example: Robert Lewandowski's real 50th goal for Poland, vs. Sweden."""
+
+    def test_player_goal_milestone_matches_lewandowskis_real_50th(self) -> None:
+        fact = _fact(
+            "player_goal_milestone",
+            "Poland",
+            {"player_name": "Robert Lewandowski", "milestone_number": 50, "opponent": "Sweden"},
+            related_teams=("Sweden",),
+        )
+        self.assertEqual(
+            templates_pl.player_goal_milestone(fact),
+            "Robert Lewandowski (Polska) zdobył swój 50. gol w kadrze narodowej, w meczu przeciwko Szwecji.",
+        )
+
+
 class HeadToHeadTemplateTestCase(unittest.TestCase):
     """h2h_never_won, h2h_first_win_since -- accusative case, singular/plural years."""
 

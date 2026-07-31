@@ -11,6 +11,7 @@ from football_ai.insights.detectors import facts_for_match, facts_for_team
 
 
 _FULL_HISTORY_PATH = Path("football_ai/data/processed/international_results_full_history.parquet")
+_GOALSCORERS_PATH = Path("football_ai/data/processed/international_results_goalscorers.parquet")
 
 
 @unittest.skipUnless(_FULL_HISTORY_PATH.exists(), "requires the regenerated full-history parquet")
@@ -53,6 +54,29 @@ class DetectorsTestCase(unittest.TestCase):
         )
         h2h_facts_before = [fact for fact in before if fact.data.get("win_year") == 2023]
         self.assertEqual(h2h_facts_before, [])
+
+    def test_omitting_goalscorers_frame_never_produces_player_facts(self) -> None:
+        """Backward compatibility: every pre-existing caller (goalscorers_frame=None) must see unchanged behavior."""
+        facts = facts_for_team(self.records_frame, "Poland")
+        self.assertNotIn("player_goal_milestone", {fact.fact_type for fact in facts})
+
+    @unittest.skipUnless(_GOALSCORERS_PATH.exists(), "requires the regenerated goalscorers parquet")
+    def test_supplying_goalscorers_frame_surfaces_polands_real_lewandowski_milestone(self) -> None:
+        """Robert Lewandowski's real 50th goal for Poland, same real cutoff verified in player_milestones tests."""
+        goalscorers_frame = pd.read_parquet(_GOALSCORERS_PATH)
+        facts = facts_for_team(
+            self.records_frame,
+            "Poland",
+            as_of_date=pd.Timestamp("2021-06-24", tz="UTC"),
+            goalscorers_frame=goalscorers_frame,
+        )
+        player_facts = [fact for fact in facts if fact.fact_type == "player_goal_milestone"]
+        self.assertTrue(
+            any(
+                fact.data["player_name"] == "Robert Lewandowski" and fact.data["milestone_number"] == 50
+                for fact in player_facts
+            )
+        )
 
 
 if __name__ == "__main__":

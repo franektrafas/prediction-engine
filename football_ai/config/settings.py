@@ -37,6 +37,7 @@ class AppSettings:
     model_artifact_dir: Path
     inference_data_path: Path
     records_frame_path: Path
+    goalscorers_frame_path: Path
     player_reference_path: Path
     injuries_path: Path
     football_api_base_url: str
@@ -91,12 +92,19 @@ def get_settings() -> AppSettings:
             str(project_root / "data" / "processed" / "international_results_full_history.parquet"),
         )
     )
+    goalscorers_frame_path = Path(
+        _read_env(
+            "GOALSCORERS_FRAME_PATH",
+            str(project_root / "data" / "processed" / "international_results_goalscorers.parquet"),
+        )
+    )
     return AppSettings(
         database=database,
         project_root=project_root,
         model_artifact_dir=model_artifact_dir,
         inference_data_path=inference_data_path,
         records_frame_path=records_frame_path,
+        goalscorers_frame_path=goalscorers_frame_path,
         player_reference_path=player_reference_path,
         injuries_path=injuries_path,
         football_api_base_url=_read_env(

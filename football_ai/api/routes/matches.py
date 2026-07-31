@@ -35,6 +35,9 @@ _prediction_service = PredictionService.create()
 _RECORDS_FRAME_COLUMNS = ["match_id", "match_date", "home_team_name", "away_team_name", "home_score", "away_score", "tournament"]
 
 
+_GOALSCORERS_FRAME_COLUMNS = ["match_id", "match_date", "home_team_name", "away_team_name", "team_name", "scorer", "own_goal"]
+
+
 def _load_records_frame() -> pd.DataFrame:
     """Load the full-history records frame once at import time, not per request.
 
@@ -50,7 +53,16 @@ def _load_records_frame() -> pd.DataFrame:
     return read_table(path)
 
 
+def _load_goalscorers_frame() -> pd.DataFrame:
+    """Load the match_id-linked goalscorers frame once at import time -- same degrade-gracefully contract."""
+    path = get_settings().goalscorers_frame_path
+    if not path.exists():
+        return pd.DataFrame(columns=_GOALSCORERS_FRAME_COLUMNS)
+    return read_table(path)
+
+
 _RECORDS_FRAME = _load_records_frame()
+_GOALSCORERS_FRAME = _load_goalscorers_frame()
 
 
 def _facts_payload(facts: list[Fact]) -> list[FactPayload]:
@@ -92,7 +104,9 @@ def match_preview(
     background_tasks.add_task(persist_prediction, payload, prediction)
 
     as_of = pd.Timestamp(match_date, tz="UTC")
-    facts = facts_for_match(_RECORDS_FRAME, home, away, as_of_date=as_of, top_n=10)
+    facts = facts_for_match(
+        _RECORDS_FRAME, home, away, as_of_date=as_of, top_n=10, goalscorers_frame=_GOALSCORERS_FRAME
+    )
 
     return MatchPreviewResponse(
         home_team=canonicalize_team_name(home),
@@ -131,7 +145,9 @@ def match_recap(home: str, away: str, match_date: date_type) -> MatchRecapRespon
     # so any streak/milestone/H2H fact this match itself created would
     # otherwise be silently excluded from its own recap.
     as_of = pd.Timestamp(match_date, tz="UTC") + pd.Timedelta(seconds=1)
-    facts = facts_for_match(_RECORDS_FRAME, home, away, as_of_date=as_of, top_n=10)
+    facts = facts_for_match(
+        _RECORDS_FRAME, home, away, as_of_date=as_of, top_n=10, goalscorers_frame=_GOALSCORERS_FRAME
+    )
 
     return MatchRecapResponse(
         home_team=canonical_home,
