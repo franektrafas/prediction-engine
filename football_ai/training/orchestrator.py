@@ -357,7 +357,20 @@ def train_target(
     stacking_model = StackingEnsembleModel(
         task_type=task_type,
         target_name=target_name,
-        base_models=fitted_models[: min(3, len(fitted_models))],
+        # Was `fitted_models[: min(3, len(fitted_models))]` -- traced back
+        # (found 2026-07-30 auditing the engine) to the original scaffold
+        # commit, never touched again since despite the stacking machinery
+        # being rewritten multiple times (leak-safe OOF, calibration,
+        # passthrough-column removal). Back when the candidate suite
+        # conditionally included LogisticRegression for classification
+        # tasks, "first 3" silently dropped CatBoost+XGBoost; today's
+        # 4-model suite (random_forest/lightgbm/catboost/xgboost, see
+        # `_build_model_suite`) has it silently drop only xgboost, purely
+        # because it's last in that list -- no evidence (real training
+        # today: xgboost's match_outcome test accuracy was competitive
+        # with every other base model) that this was ever a deliberate
+        # merit-based choice. Use every fitted candidate.
+        base_models=fitted_models,
         version=version,
     )
     stacking_model.fit(
