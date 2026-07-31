@@ -36,6 +36,7 @@ class AppSettings:
     project_root: Path
     model_artifact_dir: Path
     inference_data_path: Path
+    records_frame_path: Path
     player_reference_path: Path
     injuries_path: Path
     football_api_base_url: str
@@ -44,6 +45,7 @@ class AppSettings:
     football_api_timezone: str
     log_level: str
     default_timezone: str
+    api_key: str
 
 
 def _read_env(name: str, default: str) -> str:
@@ -83,11 +85,18 @@ def get_settings() -> AppSettings:
             str(project_root / "data" / "processed" / "injuries.parquet"),
         )
     )
+    records_frame_path = Path(
+        _read_env(
+            "RECORDS_FRAME_PATH",
+            str(project_root / "data" / "processed" / "international_results_full_history.parquet"),
+        )
+    )
     return AppSettings(
         database=database,
         project_root=project_root,
         model_artifact_dir=model_artifact_dir,
         inference_data_path=inference_data_path,
+        records_frame_path=records_frame_path,
         player_reference_path=player_reference_path,
         injuries_path=injuries_path,
         football_api_base_url=_read_env(
@@ -99,4 +108,5 @@ def get_settings() -> AppSettings:
         football_api_timezone=_read_env("FOOTBALL_API_TIMEZONE", "Europe/Warsaw"),
         log_level=_read_env("LOG_LEVEL", "INFO"),
         default_timezone=_read_env("DEFAULT_TIMEZONE", "UTC"),
+        api_key=_read_env("FOOTBALL_AI_API_KEY", ""),
     )

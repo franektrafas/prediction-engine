@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
+from football_ai.api.routes.competitions import router as competitions_router
+from football_ai.api.routes.matches import router as matches_router
 from football_ai.api.routes.predict import router as prediction_router
 
 
@@ -13,6 +15,8 @@ app = FastAPI(
     description="REST API for national team football match predictions.",
 )
 app.include_router(prediction_router)
+app.include_router(matches_router)
+app.include_router(competitions_router)
 
 
 @app.get("/health")
