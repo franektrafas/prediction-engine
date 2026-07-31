@@ -55,8 +55,25 @@ class ModelRegistry:
         self.save(registry)
 
     def get_latest(self, target_name: str) -> RegisteredModel | None:
-        """Fetch the latest registered model for a target."""
+        """Fetch the latest registered model for a target.
+
+        Prefers the most recent `model_name="selected_model"` entry when
+        one exists -- CONFIRMED gap (found 2026-07-30 auditing the engine):
+        `training.orchestrator.train_target()` always registers
+        `"selected_model"` *last* on a successful run, so positional-last
+        happened to be correct by construction, but a run that crashes
+        after registering an individual candidate model but before
+        reaching that final registration would silently serve whatever
+        model happened to be registered last -- no error, no signal it
+        wasn't actually the chosen one. Falls back to positional-last when
+        no `"selected_model"` entry exists (e.g. a registry populated by a
+        caller that never uses that convention), preserving prior
+        behavior for that case.
+        """
         registered = self.load().get(target_name, [])
         if not registered:
             return None
+        selected_entries = [model for model in registered if model.model_name == "selected_model"]
+        if selected_entries:
+            return selected_entries[-1]
         return registered[-1]
