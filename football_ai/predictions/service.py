@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from numbers import Real
 
+import logging
 import math
 
 import joblib
@@ -24,6 +25,9 @@ from football_ai.predictions.schemas import (
     PredictionResponse,
     ProbabilityPayload,
 )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _logistic(value: float) -> float:
@@ -276,12 +280,38 @@ class PredictionService:
         name (`ColumnTransformer` against `feature_columns`/
         `categorical_columns`), not by dtype, so this is safe even for a
         column that's entirely missing and gets created here as float NaN.
+
+        Logs a warning when the live feature frame is missing columns the
+        artifact expects -- CONFIRMED gap (found 2026-07-30 auditing the
+        engine): `RegisteredModel` carries no feature-schema id, and every
+        target's artifact is loaded/aligned independently, so a
+        `features/builder.py` change that adds/renames/removes columns
+        degrades silently here (the NaN-fill above keeps `.predict()` from
+        crashing, but a caller has no way to notice a target is quietly
+        running on a stale schema until they go looking). This doesn't fix
+        the root cause -- registering a feature-schema hash alongside each
+        `RegisteredModel` and rejecting/flagging a mismatch would -- but a
+        loud log line is a real, cheap improvement over total silence, and
+        surfaces exactly which columns and target were affected.
         """
         loaded_artifact = self._load_artifact(artifact_path)
         aligned = frame.copy()
-        for column in loaded_artifact.feature_columns:
-            if column not in aligned.columns:
-                aligned[column] = np.nan
+        missing_columns = [
+            column for column in loaded_artifact.feature_columns if column not in aligned.columns
+        ]
+        if missing_columns:
+            LOGGER.warning(
+                "Feature schema drift for target '%s' (artifact %s): %d column(s) the "
+                "trained artifact expects are absent from the live feature frame and will "
+                "be NaN-filled: %s%s",
+                loaded_artifact.target_name,
+                artifact_path,
+                len(missing_columns),
+                missing_columns[:10],
+                "..." if len(missing_columns) > 10 else "",
+            )
+        for column in missing_columns:
+            aligned[column] = np.nan
         aligned = aligned[loaded_artifact.feature_columns].copy()
         aligned = aligned.replace([np.inf, -np.inf], np.nan)
         return aligned, loaded_artifact

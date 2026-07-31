@@ -192,6 +192,63 @@ class PredictionServiceTestCase(unittest.TestCase):
             self.assertAlmostEqual(prediction.outcome_probabilities.draw, 0.15, places=5)
             self.assertAlmostEqual(prediction.outcome_probabilities.away_win, 0.25, places=5)
 
+    def test_align_features_warns_on_schema_drift(self) -> None:
+        """A feature the artifact expects but the live frame lacks should log a warning, not fail silently.
+
+        No `RegisteredModel`/feature-schema id links a target's artifact to
+        the `build_features()` version it was trained against (confirmed
+        2026-07-30 auditing the engine), so schema drift degrades silently
+        via NaN-fill unless something surfaces it -- this is that surface.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            registry = ModelRegistry(temp_path / "registry.json")
+            artifact_path = temp_path / "match_outcome_xgboost_drift_v1.joblib"
+            artifact = TrainedArtifact(
+                model_name="xgboost",
+                target_name="match_outcome",
+                task_type="multiclass",
+                version="drift_v1",
+                feature_columns=["home_elo", "away_elo", "a_column_the_live_pipeline_no_longer_builds"],
+                categorical_columns=[],
+                hyperparameters={},
+                estimator=DummyClassifier(),
+                metrics={},
+            )
+            joblib.dump(artifact, artifact_path)
+            service = PredictionService(registry=registry)
+            frame = pd.DataFrame([{"home_elo": 1900, "away_elo": 1850}])
+            with self.assertLogs("football_ai.predictions.service", level="WARNING") as logs:
+                aligned, _ = service._align_features(frame, artifact_path)
+            self.assertTrue(any("schema drift" in message for message in logs.output))
+            self.assertTrue(pd.isna(aligned["a_column_the_live_pipeline_no_longer_builds"].iloc[0]))
+
+    def test_align_features_does_not_warn_when_schema_matches(self) -> None:
+        """No drift, no noise -- the warning must be conditional, not unconditional."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            registry = ModelRegistry(temp_path / "registry.json")
+            artifact_path = temp_path / "match_outcome_xgboost_clean_v1.joblib"
+            artifact = TrainedArtifact(
+                model_name="xgboost",
+                target_name="match_outcome",
+                task_type="multiclass",
+                version="clean_v1",
+                feature_columns=["home_elo", "away_elo"],
+                categorical_columns=[],
+                hyperparameters={},
+                estimator=DummyClassifier(),
+                metrics={},
+            )
+            joblib.dump(artifact, artifact_path)
+            service = PredictionService(registry=registry)
+            frame = pd.DataFrame([{"home_elo": 1900, "away_elo": 1850}])
+            with self.assertRaises(AssertionError):
+                # assertLogs itself raises AssertionError when nothing was logged --
+                # that's the expected, desired outcome here, so this is inverted on purpose.
+                with self.assertLogs("football_ai.predictions.service", level="WARNING"):
+                    service._align_features(frame, artifact_path)
+
     def test_flat_multiclass_prediction_falls_back_to_heuristic_blend(self) -> None:
         """Flat 1X2 probabilities should be replaced by a more informative fallback."""
         with tempfile.TemporaryDirectory() as temp_dir:
