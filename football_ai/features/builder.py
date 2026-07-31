@@ -28,7 +28,17 @@ BASE_MATCH_COLUMNS = [
 
 
 def _safe_series(frame: pd.DataFrame, column: str, default_value: float = 0.0) -> pd.Series:
-    """Return a column when present or a default-valued Series otherwise."""
+    """Return a column when present or a default-valued Series otherwise.
+
+    `default_value` should be `np.nan`, not `0.0`, for any column that ever
+    feeds a rolling aggregate (`_add_rolling_features`'s `.rolling().mean()`
+    treats `0.0` as a real observation, dragging the average toward zero for
+    matches where the stat was simply never recorded -- indistinguishable
+    from "this team genuinely scored/possessed nothing"). `0.0` remains the
+    right default for columns that are never rolled and where "no data"
+    should read as a neutral zero to a caller (e.g. `injured_market_value` --
+    see `test_injured_market_value_diff_defaults_to_zero_without_source_data`).
+    """
     if column in frame.columns:
         return frame[column].fillna(default_value)
     return pd.Series(default_value, index=frame.index, dtype=float)
@@ -50,15 +60,19 @@ def build_team_match_frame(matches: pd.DataFrame) -> pd.DataFrame:
             "is_home": 1,
             "goals_for": _safe_series(match_frame, "home_score"),
             "goals_against": _safe_series(match_frame, "away_score"),
-            "xg": _safe_series(match_frame, "home_xg"),
-            "xga": _safe_series(match_frame, "away_xg"),
-            "shots": _safe_series(match_frame, "home_shots"),
-            "shots_on_target": _safe_series(match_frame, "home_shots_on_target"),
-            "corners": _safe_series(match_frame, "home_corners"),
-            "cards": _safe_series(match_frame, "home_yellow_cards")
-            + _safe_series(match_frame, "home_red_cards"),
-            "possession": _safe_series(match_frame, "home_possession"),
-            "pressing_intensity": _safe_series(match_frame, "home_pressing_intensity"),
+            # NaN default (not 0.0) -- these feed rolling means whenever a
+            # caller's config re-adds them to rolling_metrics (see
+            # `_safe_series`'s docstring); a StatsBomb-sparse row's "no data"
+            # must not silently read as "team recorded exactly 0" once rolled.
+            "xg": _safe_series(match_frame, "home_xg", default_value=np.nan),
+            "xga": _safe_series(match_frame, "away_xg", default_value=np.nan),
+            "shots": _safe_series(match_frame, "home_shots", default_value=np.nan),
+            "shots_on_target": _safe_series(match_frame, "home_shots_on_target", default_value=np.nan),
+            "corners": _safe_series(match_frame, "home_corners", default_value=np.nan),
+            "cards": _safe_series(match_frame, "home_yellow_cards", default_value=np.nan)
+            + _safe_series(match_frame, "home_red_cards", default_value=np.nan),
+            "possession": _safe_series(match_frame, "home_possession", default_value=np.nan),
+            "pressing_intensity": _safe_series(match_frame, "home_pressing_intensity", default_value=np.nan),
             "elo_pre_match": _safe_series(match_frame, "home_elo"),
             "lineup_average_age": _safe_series(match_frame, "home_lineup_average_age"),
             "lineup_market_value": _safe_series(match_frame, "home_lineup_market_value"),
@@ -77,15 +91,15 @@ def build_team_match_frame(matches: pd.DataFrame) -> pd.DataFrame:
             "is_home": 0,
             "goals_for": _safe_series(match_frame, "away_score"),
             "goals_against": _safe_series(match_frame, "home_score"),
-            "xg": _safe_series(match_frame, "away_xg"),
-            "xga": _safe_series(match_frame, "home_xg"),
-            "shots": _safe_series(match_frame, "away_shots"),
-            "shots_on_target": _safe_series(match_frame, "away_shots_on_target"),
-            "corners": _safe_series(match_frame, "away_corners"),
-            "cards": _safe_series(match_frame, "away_yellow_cards")
-            + _safe_series(match_frame, "away_red_cards"),
-            "possession": _safe_series(match_frame, "away_possession"),
-            "pressing_intensity": _safe_series(match_frame, "away_pressing_intensity"),
+            "xg": _safe_series(match_frame, "away_xg", default_value=np.nan),
+            "xga": _safe_series(match_frame, "home_xg", default_value=np.nan),
+            "shots": _safe_series(match_frame, "away_shots", default_value=np.nan),
+            "shots_on_target": _safe_series(match_frame, "away_shots_on_target", default_value=np.nan),
+            "corners": _safe_series(match_frame, "away_corners", default_value=np.nan),
+            "cards": _safe_series(match_frame, "away_yellow_cards", default_value=np.nan)
+            + _safe_series(match_frame, "away_red_cards", default_value=np.nan),
+            "possession": _safe_series(match_frame, "away_possession", default_value=np.nan),
+            "pressing_intensity": _safe_series(match_frame, "away_pressing_intensity", default_value=np.nan),
             "elo_pre_match": _safe_series(match_frame, "away_elo"),
             "lineup_average_age": _safe_series(match_frame, "away_lineup_average_age"),
             "lineup_market_value": _safe_series(match_frame, "away_lineup_market_value"),

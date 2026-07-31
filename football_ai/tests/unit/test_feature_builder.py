@@ -7,6 +7,7 @@ import unittest
 import pandas as pd
 
 from football_ai.features.builder import build_features
+from football_ai.features.schemas import FeatureBuilderConfig
 
 
 class FeatureBuilderTestCase(unittest.TestCase):
@@ -119,6 +120,34 @@ class FeatureBuilderTestCase(unittest.TestCase):
         feature_result = build_features(matches)
         leaked = {"home_cards", "away_cards"} & set(feature_result.feature_columns)
         self.assertFalse(leaked, f"Raw current-match cards columns leaked as features: {leaked}")
+
+    def test_missing_xg_rows_do_not_drag_down_a_teams_rolling_xg_mean(self) -> None:
+        """Regression test: `_safe_series` used to default missing xg to 0.0, corrupting rolling means.
+
+        A rolling mean over [2.0, missing] should reflect the one real
+        observation (2.0), not treat the missing row as a real 0.0 and
+        average to 1.0 -- exactly the sparse-StatsBomb-coverage scenario
+        `FeatureBuilderConfig.rolling_metrics`'s own docstring describes
+        ("re-add once StatsBomb... covers enough of the dataset"). xg must
+        be explicitly requested here since it's not in the default
+        rolling_metrics (dropped 2026-07-24 for low importance at 1.1%
+        coverage) -- that's a separate, deliberate default-config choice,
+        not what this test is about.
+        """
+        matches = pd.DataFrame(
+            [
+                {"match_date": "2024-01-01", "home_team_name": "England", "away_team_name": "France",
+                 "home_score": 2, "away_score": 1, "home_xg": 2.0},
+                {"match_date": "2024-01-05", "home_team_name": "England", "away_team_name": "Spain",
+                 "home_score": 1, "away_score": 1},  # no home_xg for this row -- StatsBomb gap
+                {"match_date": "2024-01-09", "home_team_name": "England", "away_team_name": "Italy",
+                 "home_score": 1, "away_score": 0, "home_xg": 1.4},
+            ]
+        )
+        config = FeatureBuilderConfig(rolling_metrics=FeatureBuilderConfig().rolling_metrics + ("xg",))
+        feature_result = build_features(matches, config=config)
+        third_match = feature_result.frame.iloc[2]
+        self.assertEqual(third_match["home_xg_mean_3"], 2.0)
 
 
 if __name__ == "__main__":
