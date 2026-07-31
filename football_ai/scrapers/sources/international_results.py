@@ -79,10 +79,21 @@ class InternationalResultsSource(BaseDataSource):
         just empty facts -- reproduced for real: `team_matches(df,
         "Czechia")` returned 0 rows against 363 real "Czech Republic" rows
         before this fix.
+
+        `match_date` is UTC-aware (`utc=True`), not naive -- CONFIRMED bug
+        (found 2026-07-30 auditing the engine): `build_records_frame()`
+        returns this frame as-is when `elo_source_path` is `None`/missing,
+        but returns a UTC-aware frame (via `data.enrichment.merge_advanced_stats`,
+        which itself calls `pd.to_datetime(..., utc=True)`) when Elo
+        enrichment succeeds -- the exact same function's return dtype
+        depended on an unrelated file's existence. `insights/`'s
+        `as_of_date` filtering compares against `tz="UTC"` timestamps and
+        raises `TypeError` on a naive frame. Setting `utc=True` here makes
+        every `build_records_frame()` path consistent from the start.
         """
         normalized = pd.DataFrame(
             {
-                "match_date": pd.to_datetime(raw["date"]),
+                "match_date": pd.to_datetime(raw["date"], utc=True),
                 "home_team_name": raw["home_team"].map(canonicalize_team_name),
                 "away_team_name": raw["away_team"].map(canonicalize_team_name),
                 "home_score": raw["home_score"],

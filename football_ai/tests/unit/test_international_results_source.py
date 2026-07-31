@@ -93,6 +93,20 @@ class InternationalResultsSourceTestCase(unittest.TestCase):
         self.assertEqual(len(records_frame), 3)
         self.assertNotIn("home_elo", records_frame.columns)
 
+    def test_match_date_is_utc_aware_regardless_of_whether_elo_enrichment_ran(self) -> None:
+        """Regression test: match_date used to be tz-naive without Elo, tz-aware with it.
+
+        `insights/`'s `as_of_date` filtering compares against `tz="UTC"`
+        timestamps and raises `TypeError` on a naive frame -- both
+        build_records_frame() code paths (with and without a real Elo
+        source) must return the same, UTC-aware dtype.
+        """
+        with mock.patch.object(self.source, "fetch_text", return_value=_RESULTS_CSV):
+            without_elo = self.source.build_records_frame(elo_source_path=None)
+            with_missing_elo_path = self.source.build_records_frame(elo_source_path="/nonexistent/path.parquet")
+        self.assertEqual(str(without_elo["match_date"].dt.tz), "UTC")
+        self.assertEqual(str(with_missing_elo_path["match_date"].dt.tz), "UTC")
+
     def test_build_records_frame_with_missing_elo_file_path_degrades_gracefully(self) -> None:
         """A non-existent Elo path (e.g. before first real training run) shouldn't raise."""
         with mock.patch.object(self.source, "fetch_text", return_value=_RESULTS_CSV):
