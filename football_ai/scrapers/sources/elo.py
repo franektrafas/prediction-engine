@@ -125,6 +125,24 @@ class WorldFootballEloSource(BaseDataSource):
             ]
         ]
 
+    @staticmethod
+    def latest_ratings_by_team(snapshot: pd.DataFrame) -> dict[str, float]:
+        """Convert a normalized Elo snapshot into a `{canonical_team_name: rating}` lookup.
+
+        `team_name` is already canonicalized by `normalize_snapshot()`, so
+        this is a plain reshape, not another resolution step. Built to feed
+        real, current Elo into live fixture predictions (see
+        `simulation.fixture_input.build_simulation_input`'s `elo_ratings`
+        parameter) -- closes the gap that module's docstring flagged
+        2026-07-30: the static training file's `home_elo`/`away_elo` are
+        real only for ~2018-2024, but a live snapshot fetched right now is
+        real for every currently-rated team, which is exactly what an
+        upcoming/future fixture needs (there's no leak-safety concern for a
+        *future* match -- unlike a historical one, "today's real rating" is
+        the only pre-match information that could ever exist for it).
+        """
+        return dict(zip(snapshot["team_name"], snapshot["rating"].astype(float)))
+
     def ingest_snapshot_to_database(self, session: Session, snapshot: pd.DataFrame) -> None:
         """Persist a normalized Elo snapshot to the database."""
         for row in snapshot.to_dict(orient="records"):

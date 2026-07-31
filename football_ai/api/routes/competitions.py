@@ -9,20 +9,49 @@ originally flagged as an open external dependency and closed on
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from football_ai.api.routes.auth import require_api_key
 from football_ai.api.schemas import CompetitionOutlookResponse, GroupStandingPayload
 from football_ai.predictions.service import PredictionService
+from football_ai.scrapers.sources.elo import WorldFootballEloSource
 from football_ai.scrapers.sources.uefa_nations_league import UefaNationsLeagueSource
 from football_ai.simulation.competition import compute_standings, simulate_group_qualification
 from football_ai.simulation.fixture_input import build_simulation_input
 
 
+LOGGER = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/v1/competitions", tags=["competitions"], dependencies=[Depends(require_api_key)])
 
 _prediction_service = PredictionService.create()
 _uefa_source = UefaNationsLeagueSource()
+_elo_source = WorldFootballEloSource()
+_elo_ratings_cache: dict[str, float] | None = None
+
+
+def _get_elo_ratings() -> dict[str, float]:
+    """Real, current Elo per team -- fetched once per process, cached, never crashes on failure.
+
+    A failed fetch (eloratings.net unreachable) degrades to an empty dict
+    -- `build_simulation_input()` already falls back to
+    `PredictionService`'s own default per team when a rating is missing,
+    same graceful-degradation contract every other real-data dependency in
+    this route module already follows (`matches.py`'s records/goalscorers
+    frames, `PredictionService.create()`'s own missing-file handling).
+    """
+    global _elo_ratings_cache
+    if _elo_ratings_cache is not None:
+        return _elo_ratings_cache
+    try:
+        snapshot = _elo_source.fetch_current_snapshot()
+        _elo_ratings_cache = WorldFootballEloSource.latest_ratings_by_team(snapshot)
+    except Exception:
+        LOGGER.warning("Failed to fetch live Elo ratings; falling back to no Elo context.", exc_info=True)
+        _elo_ratings_cache = {}
+    return _elo_ratings_cache
 
 
 @router.get("/outlook", response_model=CompetitionOutlookResponse)
@@ -51,7 +80,7 @@ def competition_outlook(
             detail=f"No fixtures found for {season} UEFA Nations League {division}, group {group}.",
         )
 
-    simulation_input = build_simulation_input(fixtures, _prediction_service)
+    simulation_input = build_simulation_input(fixtures, _prediction_service, elo_ratings=_get_elo_ratings())
     standings_so_far = compute_standings(simulation_input.teams, simulation_input.played_matches, [])
     probabilities = simulate_group_qualification(
         simulation_input.teams,

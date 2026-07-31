@@ -137,6 +137,26 @@ class BuildSimulationInputTestCase(unittest.TestCase):
             sorted(["Poland", "Bosnia and Herzegovina", "Sweden", "Romania"]),
         )
 
+    def test_elo_ratings_reach_the_prediction_payload(self) -> None:
+        """A real Elo gap must move expected goals away from the flat no-Elo 1.35/1.10 heuristic default.
+
+        `elo_ratings` uses real, current (2026-07-31) ratings for the two
+        teams -- Sweden (1731) vs. Romania (1639) -- fed via
+        `WorldFootballEloSource.latest_ratings_by_team()`'s real shape.
+        """
+        elo_ratings = {"Sweden": 1731.0, "Romania": 1639.0}
+        result = build_simulation_input(_REAL_UNPLAYED_FIXTURES, self.prediction_service, elo_ratings=elo_ratings)
+        sweden_vs_romania = next(m for m in result.remaining_matches if m.home_team == "Sweden")
+        self.assertNotAlmostEqual(sweden_vs_romania.expected_home_goals, 1.35, places=2)
+        self.assertGreater(sweden_vs_romania.expected_home_goals, sweden_vs_romania.expected_away_goals)
+
+    def test_a_team_missing_from_elo_ratings_falls_back_to_the_default(self) -> None:
+        """elo_ratings covering only ONE team in a match must not crash -- the other side stays unset."""
+        result = build_simulation_input(
+            _REAL_UNPLAYED_FIXTURES, self.prediction_service, elo_ratings={"Poland": 1710.0}
+        )
+        self.assertEqual(len(result.remaining_matches), 2)
+
     def test_near_zero_predicted_goals_are_floored_to_a_positive_value(self) -> None:
         """MatchExpectation rejects goals <= 0 -- this module must clamp before constructing it, not crash.
 

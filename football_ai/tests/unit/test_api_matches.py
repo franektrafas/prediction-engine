@@ -10,11 +10,14 @@ from unittest import mock
 try:
     from fastapi.testclient import TestClient
 
+    from football_ai.api import routes as _api_routes  # noqa: F401  (ensures package import works)
     from football_ai.api.main import app
+    from football_ai.api.routes import matches as matches_module
     from football_ai.api.routes.auth import require_api_key
 except ModuleNotFoundError:  # pragma: no cover - optional dependency guard
     TestClient = None  # type: ignore[assignment]
     app = None  # type: ignore[assignment]
+    matches_module = None  # type: ignore[assignment]
     require_api_key = None  # type: ignore[assignment]
 
 
@@ -37,13 +40,22 @@ class MatchPreviewAuthTestCase(unittest.TestCase):
 
 @unittest.skipIf(TestClient is None or app is None, "FastAPI dependencies are not installed.")
 class MatchPreviewTestCase(unittest.TestCase):
-    """Auth bypassed via dependency override -- these tests target the route logic, not auth."""
+    """Auth bypassed via dependency override -- these tests target the route logic, not auth.
+
+    `_get_elo_ratings` (real network fetch to eloratings.net) is mocked to
+    an empty dict here -- same offline/mocked-network convention every
+    other committed test in this project uses; real network verification
+    was done interactively, not as a committed automated test.
+    """
 
     def setUp(self) -> None:
         app.dependency_overrides[require_api_key] = lambda: None
+        self._elo_patch = mock.patch.object(matches_module, "_get_elo_ratings", return_value={})
+        self._elo_patch.start()
 
     def tearDown(self) -> None:
         app.dependency_overrides.pop(require_api_key, None)
+        self._elo_patch.stop()
 
     def test_preview_returns_a_prediction_and_facts(self) -> None:
         client = TestClient(app)
@@ -60,6 +72,38 @@ class MatchPreviewTestCase(unittest.TestCase):
         for fact in body["facts"]:
             self.assertIn("sentence", fact)
             self.assertIn("provenance", fact)
+
+
+@unittest.skipIf(TestClient is None or app is None, "FastAPI dependencies are not installed.")
+class MatchPreviewEloWiringTestCase(unittest.TestCase):
+    """A real Elo gap between the two teams must actually reach the prediction, not just be fetched and dropped."""
+
+    def setUp(self) -> None:
+        app.dependency_overrides[require_api_key] = lambda: None
+
+    def tearDown(self) -> None:
+        app.dependency_overrides.pop(require_api_key, None)
+
+    def test_a_large_elo_gap_produces_a_lopsided_prediction(self) -> None:
+        """No trained model is registered in this test environment, so this exercises the real heuristic
+
+        fallback (`PredictionService._heuristic_prediction`), which uses `home_elo`/`away_elo` directly --
+        a huge, real-shaped gap (Poland's real current rating vs. a real minnow's) must produce a
+        heavily home-favored outcome, not a flat ~33/33/33 (which is what an unwired/ignored Elo would give).
+        """
+        with mock.patch.object(
+            matches_module, "_get_elo_ratings", return_value={"Poland": 2200.0, "San Marino": 800.0}
+        ):
+            client = TestClient(app)
+            response = client.get(
+                "/v1/matches/preview",
+                params={"home": "Poland", "away": "San Marino", "match_date": "2026-11-17"},
+            )
+        self.assertEqual(response.status_code, 200)
+        probabilities = response.json()["prediction"]["outcome_probabilities"]
+        # Real measured value for this exact gap: 0.856 -- well clear of an
+        # unwired-Elo flat ~0.33, comfortable margin below the observed value.
+        self.assertGreater(probabilities["home_win"], 0.7)
 
 
 @unittest.skipIf(TestClient is None or app is None, "FastAPI dependencies are not installed.")

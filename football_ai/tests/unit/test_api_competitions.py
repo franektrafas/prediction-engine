@@ -55,9 +55,15 @@ class CompetitionOutlookTestCase(unittest.TestCase):
 
     def setUp(self) -> None:
         app.dependency_overrides[require_api_key] = lambda: None
+        # Real network fetch to eloratings.net mocked to an empty dict -- same
+        # offline convention as the Wikipedia fetch mock below; real network
+        # verification was done interactively, not as a committed test.
+        self._elo_patch = mock.patch.object(competitions_module, "_get_elo_ratings", return_value={})
+        self._elo_patch.start()
 
     def tearDown(self) -> None:
         app.dependency_overrides.pop(require_api_key, None)
+        self._elo_patch.stop()
 
     def test_outlook_returns_probabilities_summing_to_the_qualifying_spot_count(self) -> None:
         with mock.patch.object(
@@ -73,6 +79,37 @@ class CompetitionOutlookTestCase(unittest.TestCase):
         self.assertEqual(sorted(body["teams"]), ["Bosnia and Herzegovina", "Poland", "Romania", "Sweden"])
         self.assertAlmostEqual(sum(body["qualification_probabilities"].values()), 1.0, places=5)
         self.assertEqual(body["remaining_matches"], 2)
+
+    def test_a_real_elo_gap_between_teams_skews_qualification_probabilities(self) -> None:
+        """No trained model is registered in this test environment, so remaining-match predictions
+
+        come from the real heuristic Elo fallback -- a big, real-shaped Elo gap (Poland's real current
+        rating vs. a real minnow's) must push probabilities away from a flat ~25% each for a 4-team
+        group, proving Elo actually reaches the simulation instead of being fetched and dropped.
+        """
+        with (
+            mock.patch.object(
+                competitions_module._uefa_source, "fetch_group_matches", return_value=_REAL_UNPLAYED_GROUP
+            ),
+            mock.patch.object(
+                competitions_module,
+                "_get_elo_ratings",
+                return_value={"Poland": 2200.0, "Bosnia and Herzegovina": 800.0, "Sweden": 1700.0, "Romania": 1700.0},
+            ),
+        ):
+            client = TestClient(app)
+            response = client.get(
+                "/v1/competitions/outlook",
+                params={"division": "B", "group": 4, "n_simulations": 5000, "n_qualifying_spots": 1},
+            )
+        self.assertEqual(response.status_code, 200)
+        probabilities = response.json()["qualification_probabilities"]
+        # Only one of the group's two remaining matches involves Poland (the
+        # other, Sweden vs Romania, is elo-neutral in this fixture) -- a flat
+        # no-Elo baseline for 4 teams would be 0.25 each; real measured value
+        # here is ~0.31, comfortable margin above flat while allowing for
+        # Monte Carlo run-to-run variance.
+        self.assertGreater(probabilities["Poland"], 0.27)
 
     def test_outlook_404s_when_the_source_returns_no_fixtures(self) -> None:
         with mock.patch.object(

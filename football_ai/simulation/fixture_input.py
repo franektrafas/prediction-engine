@@ -13,17 +13,20 @@ Works with any wide-schema fixtures frame (`home_team_name`/
 `stadium`) -- `UefaNationsLeagueSource.fetch_group_matches()` is the first
 caller, not the only one this is built for.
 
-Known, deliberately unaddressed gap (confirmed 2026-07-30): the default
-inference dataset's `home_elo`/`away_elo` columns are a real Elo merge only
-for roughly 2018-2024; essentially every 2025/2026 match (i.e. every team's
-most recent real form going into these Nations League fixtures) falls back
-to a flat 1509.0/1483.0 default -- the SAME number regardless of which team
-is playing, worse than useless if surfaced as if it were real. This module
-deliberately leaves `home_elo`/`away_elo` unset on the prediction payload
-(`PredictionService`'s own 1500.0/1500.0 fallback applies to both sides
-equally) rather than wiring up a lookup that would silently present that
-stale default as real data. Fixing the Elo merge is engine-tuning work,
-explicitly paused by PLAN_SILNIKA.md's 2026-07-30 pivot.
+Elo gap, closed 2026-07-31: the *static training file*'s `home_elo`/
+`away_elo` columns are a real merge only for roughly 2018-2024 (every
+2025/2026 row falls back to a flat 1509.0/1483.0 default) -- but that's a
+training-data problem, not a live-fixture one. For a genuinely *future*
+match (the only kind this module ever builds a `MatchExpectation` for),
+there's no leak-safety concern in using today's real, current rating --
+unlike a historical row, "today's rating" is the only pre-match Elo that
+could ever exist for a not-yet-played fixture. `elo_ratings` (optional,
+built via `WorldFootballEloSource.fetch_current_snapshot()` +
+`.latest_ratings_by_team()`) plugs that real, live rating straight into
+each remaining match's prediction payload. Falls back to `None` per team
+when omitted or when a team isn't in the snapshot (e.g. a fetch failure,
+or a team eloratings.net doesn't track) -- `PredictionService`'s own
+1500.0/1500.0 fallback applies in that case, same as before this existed.
 """
 
 from __future__ import annotations
@@ -54,6 +57,7 @@ def build_simulation_input(
     fixtures: pd.DataFrame,
     prediction_service: PredictionService,
     tournament: str = "UEFA Nations League",
+    elo_ratings: dict[str, float] | None = None,
 ) -> SimulationInput:
     """Split a group's real fixtures into played results and model-predicted remaining matches.
 
@@ -64,8 +68,13 @@ def build_simulation_input(
     call, not a placeholder -- clamped to a small positive floor since
     `MatchExpectation`'s Poisson lambda must be strictly positive and a
     model is free to predict exactly (or near) 0.
+
+    `elo_ratings` (see module docstring) supplies real, current Elo per
+    team when available; a team missing from it gets `None`, letting
+    `PredictionService`'s own default fallback apply -- never a guess.
     """
     teams = sorted(set(fixtures["home_team_name"]) | set(fixtures["away_team_name"]))
+    ratings = elo_ratings or {}
     played_matches: list[PlayedMatch] = []
     remaining_matches: list[MatchExpectation] = []
     for row in fixtures.itertuples(index=False):
@@ -81,6 +90,8 @@ def build_simulation_input(
             away_team_name=row.away_team_name,
             tournament=tournament,
             stadium_name=stadium_name or None,
+            home_elo=ratings.get(row.home_team_name),
+            away_elo=ratings.get(row.away_team_name),
         )
         prediction = prediction_service.predict(payload)
         remaining_matches.append(

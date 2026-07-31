@@ -10,6 +10,7 @@ meaning here yet.
 
 from __future__ import annotations
 
+import logging
 from datetime import date as date_type
 
 import pandas as pd
@@ -26,11 +27,36 @@ from football_ai.narrative.renderer import render_fact
 from football_ai.predictions.persistence import persist_prediction
 from football_ai.predictions.schemas import MatchContextPayload
 from football_ai.predictions.service import PredictionService
+from football_ai.scrapers.sources.elo import WorldFootballEloSource
 
+
+LOGGER = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1/matches", tags=["matches"], dependencies=[Depends(require_api_key)])
 
 _prediction_service = PredictionService.create()
+_elo_source = WorldFootballEloSource()
+_elo_ratings_cache: dict[str, float] | None = None
+
+
+def _get_elo_ratings() -> dict[str, float]:
+    """Real, current Elo per team -- fetched once per process, cached, never crashes on failure.
+
+    Same helper as `api.routes.competitions`'s -- duplicated rather than
+    shared, matching this codebase's existing per-route-module convention
+    of each file owning its own singletons (e.g. `_prediction_service`
+    above is already duplicated the same way).
+    """
+    global _elo_ratings_cache
+    if _elo_ratings_cache is not None:
+        return _elo_ratings_cache
+    try:
+        snapshot = _elo_source.fetch_current_snapshot()
+        _elo_ratings_cache = WorldFootballEloSource.latest_ratings_by_team(snapshot)
+    except Exception:
+        LOGGER.warning("Failed to fetch live Elo ratings; falling back to no Elo context.", exc_info=True)
+        _elo_ratings_cache = {}
+    return _elo_ratings_cache
 
 _RECORDS_FRAME_COLUMNS = ["match_id", "match_date", "home_team_name", "away_team_name", "home_score", "away_score", "tournament"]
 
@@ -94,11 +120,14 @@ def match_preview(
     `persist_prediction` `/predict` already uses -- this endpoint's
     prediction is a real, first-class served prediction, not a side effect.
     """
+    elo_ratings = _get_elo_ratings()
     payload = MatchContextPayload(
         match_date=match_date,
         home_team_name=home,
         away_team_name=away,
         tournament=tournament,
+        home_elo=elo_ratings.get(canonicalize_team_name(home)),
+        away_elo=elo_ratings.get(canonicalize_team_name(away)),
     )
     prediction = _prediction_service.predict(payload)
     background_tasks.add_task(persist_prediction, payload, prediction)
