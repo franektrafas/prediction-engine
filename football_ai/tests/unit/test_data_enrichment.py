@@ -123,6 +123,65 @@ class MergeAdvancedStatsTestCase(unittest.TestCase):
         self.assertIn("match_date", merged.columns)
         self.assertFalse(pd.isna(merged.iloc[0]["match_date"]))
 
+    def test_falls_back_to_a_calendar_day_tolerance_when_exact_date_does_not_match(self) -> None:
+        """A +/-1 day date mismatch (e.g. a US-hosted evening kickoff landing on the next UTC day
+
+        in one source) must still merge -- real case: Copa America 2024's Argentina v Canada is
+        2024-06-20 in this project's base results, 2024-06-21 in StatsBomb's records.
+        """
+        base = pd.DataFrame(
+            [{"match_date": "2024-06-20", "home_team_name": "Argentina", "away_team_name": "Canada",
+              "home_score": 2, "away_score": 0}]
+        )
+        supplemental = pd.DataFrame(
+            [{"match_date": "2024-06-21", "home_team_name": "Argentina", "away_team_name": "Canada",
+              "home_score": 2, "away_score": 0, "home_xg": 2.3, "away_xg": 0.4}]
+        )
+        merged = merge_advanced_stats(base, supplemental)
+        self.assertEqual(len(merged), 1)
+        self.assertAlmostEqual(merged.iloc[0]["home_xg"], 2.3)
+        self.assertAlmostEqual(merged.iloc[0]["away_xg"], 0.4)
+
+    def test_fallback_still_fires_when_a_supplemental_column_name_is_already_populated_in_base(self) -> None:
+        """Regression test for a real bug: detecting "still unmatched" by checking whether the
+
+        supplemental stat columns are null broke down when one of those column names (e.g.
+        `tournament`) was already non-null in the base frame from its own unrelated data -- every
+        row looked "already matched" even when the actual merge key found nothing, so the +/-1 day
+        fallback silently never ran. Fixed by tracking match-found via pandas' own merge indicator
+        instead. This test reproduces the exact shape: `tournament` is populated on both sides
+        independently, `home_xg` only exists on the supplemental side and requires the fallback.
+        """
+        base = pd.DataFrame(
+            [{"match_date": "2024-06-20", "home_team_name": "Argentina", "away_team_name": "Canada",
+              "home_score": 2, "away_score": 0, "tournament": "Copa America"}]
+        )
+        supplemental = pd.DataFrame(
+            [{"match_date": "2024-06-21", "home_team_name": "Argentina", "away_team_name": "Canada",
+              "home_score": 2, "away_score": 0, "tournament": "Copa America", "home_xg": 2.3}]
+        )
+        merged = merge_advanced_stats(base, supplemental)
+        self.assertEqual(len(merged), 1)
+        self.assertAlmostEqual(merged.iloc[0]["home_xg"], 2.3)
+
+    def test_fallback_does_not_override_a_row_the_exact_pass_already_matched(self) -> None:
+        """The exact-date pass's result must win even when a same-named row exists a day off too."""
+        base = pd.DataFrame(
+            [{"match_date": "2022-12-18", "home_team_name": "Argentina", "away_team_name": "France",
+              "home_score": 3, "away_score": 3}]
+        )
+        supplemental = pd.DataFrame(
+            [
+                {"match_date": "2022-12-18", "home_team_name": "Argentina", "away_team_name": "France",
+                 "home_score": 3, "away_score": 3, "home_xg": 2.1},
+                {"match_date": "2022-12-19", "home_team_name": "Argentina", "away_team_name": "France",
+                 "home_score": 3, "away_score": 3, "home_xg": 99.9},
+            ]
+        )
+        merged = merge_advanced_stats(base, supplemental)
+        self.assertEqual(len(merged), 1)
+        self.assertAlmostEqual(merged.iloc[0]["home_xg"], 2.1)
+
     def test_empty_supplemental_frame_returns_base_unchanged(self) -> None:
         """An empty supplemental frame should be a safe no-op."""
         base = pd.DataFrame(

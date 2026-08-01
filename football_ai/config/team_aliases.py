@@ -22,6 +22,11 @@ TEAM_ALIASES: dict[str, str] = {
     "dr congo": "Congo DR",
     "congo dr": "Congo DR",
     "cape verde": "Cabo Verde",
+    # StatsBomb's real spelling for AFCON 2023 (confirmed 2026-08-01 diagnosing
+    # the merge_advanced_stats gap) -- without this, every Cape Verde match in
+    # that tournament silently failed to merge, not because of a date/timezone
+    # issue like most of the rest of that gap, just an unmapped spelling.
+    "cape verde islands": "Cabo Verde",
     "curacao": "Curacao",
     "syria": "Syria",
     "eswatini": "Swaziland",
