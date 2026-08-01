@@ -5,6 +5,8 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
+import pandas as pd
+
 from football_ai.scrapers.sources.espn import EspnSource
 
 
@@ -21,6 +23,7 @@ def _scoreboard_event(
     away_score: str,
     match_date: str = "2022-11-26T13:00Z",
     status: str = "STATUS_FULL_TIME",
+    completed: bool = True,
 ) -> dict:
     """Build an ESPN-shaped scoreboard event payload."""
     return {
@@ -28,7 +31,7 @@ def _scoreboard_event(
         "date": match_date,
         "competitions": [
             {
-                "status": {"type": {"name": status}},
+                "status": {"type": {"name": status, "completed": completed}},
                 "venue": {"fullName": "Lusail Stadium"},
                 "competitors": [
                     _competitor("home", home_team, home_score),
@@ -111,15 +114,40 @@ class EspnWideMatchesTestCase(unittest.TestCase):
         self.assertEqual(frame.iloc[0]["home_team_name"], "Argentina")
         self.assertNotIn("home_shots", frame.columns)
 
+    def test_normalize_matches_truncates_kickoff_time_to_midnight_utc(self) -> None:
+        """Regression test for a real bug: keeping ESPN's real kickoff time broke the merge into
+
+        the project's base file almost entirely. `merge_advanced_stats` keys on exact `match_date`
+        equality, and the base file (like every other source in this project) only ever carries a
+        bare date -- live-tested against the real base file, keeping the kickoff time meant only
+        9 of 841 real ESPN matches merged (pure coincidence of a 00:00 UTC kickoff), fixed by
+        truncating to midnight UTC here to match the rest of the project's date-only convention.
+        """
+        events = [_scoreboard_event(1, "Poland", "Czechia", "1", "1", match_date="2023-11-17T19:45Z")]
+        frame = self.source.normalize_matches(events)
+        self.assertEqual(frame.iloc[0]["match_date"], pd.Timestamp("2023-11-17", tz="UTC"))
+
     def test_normalize_matches_skips_unplayed_fixtures(self) -> None:
         """A scheduled-but-not-yet-played fixture has no real score and must be dropped."""
         events = [
-            _scoreboard_event(1, "Poland", "Sweden", "", "", status="STATUS_SCHEDULED"),
+            _scoreboard_event(1, "Poland", "Sweden", "", "", status="STATUS_SCHEDULED", completed=False),
             _scoreboard_event(2, "Spain", "Italy", "2", "1"),
         ]
         frame = self.source.normalize_matches(events)
         self.assertEqual(len(frame), 1)
         self.assertEqual(frame.iloc[0]["home_team_name"], "Spain")
+
+    def test_normalize_matches_keeps_a_penalty_shootout_decided_match(self) -> None:
+        """Regression test for a real bug: a knockout match decided on penalties gets its own
+
+        status name (`STATUS_FINAL_PEN`), not `STATUS_FULL_TIME` -- a name-only check silently
+        dropped all 5 of the real 2022 World Cup's penalty-shootout matches. `completed` is the
+        real signal ESPN itself uses to mark a match finished, regardless of how it finished.
+        """
+        events = [_scoreboard_event(1, "Japan", "Croatia", "1", "1", status="STATUS_FINAL_PEN")]
+        frame = self.source.normalize_matches(events)
+        self.assertEqual(len(frame), 1)
+        self.assertEqual(frame.iloc[0]["home_score"], 1)
 
     def test_build_all_international_matches_skips_a_failing_competition(self) -> None:
         """One competition failing to fetch shouldn't abort the rest of the batch."""

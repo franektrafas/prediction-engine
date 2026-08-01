@@ -168,30 +168,38 @@ class InternationalResultsSource(BaseDataSource):
         matched["match_id"] = matched["match_id"].astype("int64")
         return matched.sort_values("match_date").reset_index(drop=True)
 
-    def build_records_frame(self, elo_source_path: str | Path | None = None) -> pd.DataFrame:
-        """Build the full-history records frame: martj42 identity/score + our Elo where it overlaps.
+    def build_records_frame(
+        self,
+        elo_source_path: str | Path | None = None,
+        espn_source_path: str | Path | None = None,
+    ) -> pd.DataFrame:
+        """Build the full-history records frame: martj42 identity/score + Elo + ESPN stats.
 
         martj42 is the merge *base* (identity/score/date/tournament always
-        wins -- it's the larger, actively-maintained source) and our
-        existing Elo file is *supplemental* (`merge_advanced_stats` only
-        fills columns the base doesn't already have -- martj42 has no Elo
-        columns at all, so this is pure enrichment, never a real conflict).
-        Pre-2000 rows simply get no Elo (`eloratings.net` coverage doesn't
-        reach that far either) -- expected, not a bug; `records_frame` isn't
-        meant to feed model training anyway.
+        wins -- it's the larger, actively-maintained source); Elo and ESPN
+        are both *supplemental* (`merge_advanced_stats` only fills columns
+        the base doesn't already have, so layering both in sequence is pure
+        enrichment, never a real conflict between them). Pre-2000 rows get
+        no Elo (`eloratings.net` coverage doesn't reach that far either) and
+        most rows get no ESPN stats (only the competitions curated in
+        `scrapers.sources.espn.INTERNATIONAL_COMPETITIONS` have real ESPN
+        boxscore data) -- both expected, not a bug; `records_frame` isn't
+        meant to feed model training directly anyway.
         """
         results = self.normalize_results(self.fetch_results())
-        if elo_source_path is None:
-            return results
-        elo_source = Path(elo_source_path)
-        if not elo_source.exists():
-            LOGGER.warning(
-                "Elo source %s not found; records_frame will have no Elo columns.",
-                elo_source,
-            )
-            return results
-        elo_frame = read_table(elo_source)
-        return merge_advanced_stats(base_matches=results, supplemental_matches=elo_frame)
+        if elo_source_path is not None:
+            elo_source = Path(elo_source_path)
+            if elo_source.exists():
+                results = merge_advanced_stats(base_matches=results, supplemental_matches=read_table(elo_source))
+            else:
+                LOGGER.warning("Elo source %s not found; records_frame will have no Elo columns.", elo_source)
+        if espn_source_path is not None:
+            espn_source = Path(espn_source_path)
+            if espn_source.exists():
+                results = merge_advanced_stats(base_matches=results, supplemental_matches=read_table(espn_source))
+            else:
+                LOGGER.warning("ESPN source %s not found; records_frame will have no ESPN stat columns.", espn_source)
+        return results
 
     def build_training_frame(
         self,
@@ -226,6 +234,15 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--espn-source",
+        default="football_ai/data/processed/espn_international_enriched.parquet",
+        help=(
+            "Path to the pre-built ESPN-enriched matches file to merge in "
+            "(built via `python -m football_ai.scrapers.sources.espn --mode enrich`). "
+            "Pass an empty string to skip ESPN enrichment entirely."
+        ),
+    )
+    parser.add_argument(
         "--records-output",
         default="football_ai/data/processed/international_results_full_history.parquet",
         help="Output path for the full-history records frame.",
@@ -257,7 +274,9 @@ if __name__ == "__main__":
 
         elo_path = get_settings().inference_data_path
 
-    records_frame = source.build_records_frame(elo_source_path=elo_path)
+    records_frame = source.build_records_frame(
+        elo_source_path=elo_path, espn_source_path=arguments.espn_source or None
+    )
     write_table(records_frame, arguments.records_output)
     print(
         f"records_frame: {len(records_frame)} matches, "

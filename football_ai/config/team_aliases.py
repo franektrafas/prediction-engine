@@ -36,6 +36,13 @@ TEAM_ALIASES: dict[str, str] = {
     "northern ireland": "Northern Ireland",
     "wales": "Wales",
     "scotland": "Scotland",
+    # ESPN's real spelling for Turkey (its own official rebrand, confirmed
+    # 2026-08-02 diagnosing why 24 of 841 real ESPN matches weren't merging
+    # into the base file -- all 24 involved Turkey, none of them a
+    # date/timezone issue like the earlier StatsBomb gap, just this
+    # unmapped spelling. Base file's own canonical spelling is "Turkey"
+    # (314 real rows), so that stays canonical rather than switching over.
+    "turkiye": "Turkey",
     # Historical entities with a clean, continuous successor -- sourced from
     # martj42/international_results' former_names.csv (2026-07-24), which
     # documents renames of a still-continuous federation, plus "west germany"

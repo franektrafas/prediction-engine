@@ -88,13 +88,24 @@ class EspnSource(BaseDataSource):
         events without it, which is below a full qualifying campaign's real
         match count (a full 2023 calendar year of Euro 2024 qualifying alone
         is 230 matches).
+
+        Chunks the request by calendar year -- CONFIRMED REAL (live-tested
+        2026-08-01): a `dates=` range spanning more than ~1 year returns an
+        HTTP 400, so a competition like Euro qualifying (Mar 2023-Apr 2024)
+        needs one request per calendar year it touches, not one request for
+        the whole campaign.
         """
-        payload = self.fetch_json(
-            f"{self.BASE_URL}/{league_slug}/scoreboard",
-            params={"dates": f"{start_date}-{end_date}", "limit": 1000},
-        )
-        self.persist_raw_json(payload, f"scoreboard_{league_slug}_{start_date}_{end_date}.json")
-        return payload.get("events", [])
+        events: list[dict[str, Any]] = []
+        for year in range(int(start_date[:4]), int(end_date[:4]) + 1):
+            chunk_start = max(start_date, f"{year}0101")
+            chunk_end = min(end_date, f"{year}1231")
+            payload = self.fetch_json(
+                f"{self.BASE_URL}/{league_slug}/scoreboard",
+                params={"dates": f"{chunk_start}-{chunk_end}", "limit": 1000},
+            )
+            self.persist_raw_json(payload, f"scoreboard_{league_slug}_{chunk_start}_{chunk_end}.json")
+            events.extend(payload.get("events", []))
+        return events
 
     def fetch_summary(self, league_slug: str, event_id: str) -> dict[str, Any]:
         """Fetch the full match summary (incl. boxscore stats) for one event."""
@@ -107,12 +118,29 @@ class EspnSource(BaseDataSource):
 
         Only finished matches are kept -- an unplayed fixture has no real
         score and would otherwise merge a null score into the base frame.
+        Matched on the status' `completed` flag rather than its `name` --
+        CONFIRMED REAL BUG caught live-testing this against the real 2022
+        World Cup: a knockout match decided on penalties gets a distinct
+        status name (`STATUS_FINAL_PEN`, not `STATUS_FULL_TIME`), so a
+        name-only check silently dropped all 5 of the tournament's
+        penalty-shootout matches. `score` here is confirmed to already be
+        the pre-shootout score (e.g. Japan 1-1 Croatia, not the penalty
+        tally), so no separate handling is needed for those rows.
+
+        `match_date` is truncated to midnight UTC, dropping ESPN's real
+        kickoff time -- CONFIRMED REAL BUG caught live-testing the actual
+        merge into the project's base file: `merge_advanced_stats` keys on
+        exact `match_date` equality, and the base file (like StatsBomb's
+        source data) only ever carries a bare date, never a kickoff time.
+        Keeping ESPN's real "2023-11-17T19:45Z" made essentially every row
+        fail to merge (9 of 841 matched, purely by coincidence of a few
+        matches happening to kick off at exactly 00:00 UTC) -- truncating to
+        match the rest of the project's date-only convention fixed it.
         """
         rows: list[dict[str, Any]] = []
         for event in events:
             competition = (event.get("competitions") or [{}])[0]
-            status_name = ((competition.get("status") or {}).get("type") or {}).get("name")
-            if status_name != "STATUS_FULL_TIME":
+            if not ((competition.get("status") or {}).get("type") or {}).get("completed"):
                 continue
             competitors = competition.get("competitors", [])
             home = next((c for c in competitors if c.get("homeAway") == "home"), {})
@@ -120,11 +148,12 @@ class EspnSource(BaseDataSource):
             if not home or not away:
                 continue
             venue = competition.get("venue") or {}
+            kickoff = datetime.fromisoformat(event["date"].replace("Z", "+00:00"))
             rows.append(
                 {
                     "external_id": str(event["id"]),
                     "source": "espn",
-                    "match_date": datetime.fromisoformat(event["date"].replace("Z", "+00:00")),
+                    "match_date": kickoff.replace(hour=0, minute=0, second=0, microsecond=0),
                     "stadium_name": venue.get("fullName"),
                     "home_team_name": canonicalize_team_name(home.get("team", {}).get("displayName", "")),
                     "away_team_name": canonicalize_team_name(away.get("team", {}).get("displayName", "")),

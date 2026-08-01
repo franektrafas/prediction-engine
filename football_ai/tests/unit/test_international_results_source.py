@@ -92,6 +92,56 @@ class InternationalResultsSourceTestCase(unittest.TestCase):
         non_overlapping_row = records_frame.loc[records_frame["home_team_name"] == "Germany"].iloc[0]
         self.assertTrue(pd.isna(non_overlapping_row.get("home_elo")))
 
+    def test_build_records_frame_merges_espn_stats_alongside_elo(self) -> None:
+        """ESPN stats layer in independently of Elo -- martj42 still wins identity/score."""
+        elo_source = pd.DataFrame(
+            [
+                {
+                    "match_date": "2023-06-17",
+                    "home_team_name": "Poland",
+                    "away_team_name": "Germany",
+                    "home_elo": 1650.0,
+                    "away_elo": 2000.0,
+                }
+            ]
+        )
+        espn_source = pd.DataFrame(
+            [
+                {
+                    "match_date": "2023-06-17",
+                    "home_team_name": "Poland",
+                    "away_team_name": "Germany",
+                    "home_score": 99,  # deliberately wrong -- must NOT win over martj42's score
+                    "away_score": 99,
+                    "home_shots": 12.0,
+                    "away_shots": 9.0,
+                    "home_corners": 5.0,
+                }
+            ]
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            elo_path = Path(temp_dir) / "elo.parquet"
+            espn_path = Path(temp_dir) / "espn.parquet"
+            write_table(elo_source, elo_path)
+            write_table(espn_source, espn_path)
+            with mock.patch.object(self.source, "fetch_text", return_value=_RESULTS_CSV):
+                records_frame = self.source.build_records_frame(
+                    elo_source_path=elo_path, espn_source_path=espn_path
+                )
+
+        self.assertEqual(len(records_frame), 3)
+        overlapping_row = records_frame.loc[records_frame["home_team_name"] == "Poland"].iloc[0]
+        self.assertEqual(overlapping_row["home_score"], 0)  # martj42's real score, not ESPN's 99
+        self.assertEqual(overlapping_row["home_elo"], 1650.0)  # Elo enrichment still applied
+        self.assertEqual(overlapping_row["home_shots"], 12.0)  # ESPN enrichment applied too
+        self.assertEqual(overlapping_row["home_corners"], 5.0)
+
+    def test_build_records_frame_with_missing_espn_file_path_degrades_gracefully(self) -> None:
+        """A non-existent ESPN path shouldn't raise -- same contract as a missing Elo path."""
+        with mock.patch.object(self.source, "fetch_text", return_value=_RESULTS_CSV):
+            records_frame = self.source.build_records_frame(espn_source_path="/nonexistent/path.parquet")
+        self.assertEqual(len(records_frame), 3)
+
     def test_build_records_frame_without_elo_source_returns_results_only(self) -> None:
         """A missing/unset Elo source should degrade gracefully, not raise."""
         with mock.patch.object(self.source, "fetch_text", return_value=_RESULTS_CSV):
