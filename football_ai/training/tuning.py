@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -32,6 +33,7 @@ def tune_model(
     target: pd.Series,
     categorical_columns: list[str],
     n_trials: int = 20,
+    storage_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Tune a model with Optuna using rolling time-series validation.
 
@@ -41,6 +43,16 @@ def tune_model(
     slices from `chronological_train_validation_test_split`. Folds are built
     purely from row position (`rolling_positional_splits`), so there is no
     date column to (re)derive or fake here.
+
+    `storage_path`, when given, makes the search resumable across a killed or
+    interrupted process -- CONFIRMED REAL NEED (2026-08-02): a long local
+    Optuna run was killed mid-target to save laptop battery, and with no
+    `storage=` the whole in-memory study (every already-completed trial) was
+    gone, nothing to resume from. A SQLite-backed study keyed on
+    (target, model, version) survives that: a re-run with the same key loads
+    already-completed trials and only runs however many more are needed to
+    reach `n_trials`, rather than starting over or silently running
+    `n_trials` *more* on top of what's already there.
     """
     optuna = _require_dependency("optuna")
     score_name = "f1" if model.task_type in CLASSIFICATION_TASKS else "rmse"
@@ -82,13 +94,25 @@ def tune_model(
             scores.append(metrics[score_name])
         return float(sum(scores) / len(scores))
 
-    study = optuna.create_study(direction=direction)
+    if storage_path is not None:
+        study = optuna.create_study(
+            direction=direction,
+            study_name=f"{model.target_name}__{model.model_name}__{model.version}",
+            storage=f"sqlite:///{storage_path}",
+            load_if_exists=True,
+        )
+    else:
+        study = optuna.create_study(direction=direction)
+
+    already_completed = sum(1 for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE)
+    remaining_trials = max(0, n_trials - already_completed)
     # A single trial can legitimately fail (a sampled hyperparameter
     # combination that a library's internals reject for a specific fold's
     # data, e.g. CatBoost's own numerical edge cases) without the other
     # trials being invalid -- `catch` marks that one trial FAILED and keeps
     # the search going instead of aborting the whole target's tuning.
-    study.optimize(objective, n_trials=n_trials, catch=(Exception,))
+    if remaining_trials > 0:
+        study.optimize(objective, n_trials=remaining_trials, catch=(Exception,))
     completed_trials = [
         trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE
     ]

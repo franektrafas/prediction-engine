@@ -256,6 +256,7 @@ def train_target(
     target_name: str,
     version: str = "v1",
     n_trials: int = 20,
+    optuna_storage_path: str | Path | None = None,
 ) -> list[TrainingResult]:
     """Train, evaluate, and persist all models for a target."""
     task_type = TARGET_TASK_MAPPING[target_name]
@@ -269,15 +270,23 @@ def train_target(
     fitted_models: list[BaseModelWrapper] = []
 
     for model in candidate_models:
+        # Set before tune_model(), not after -- CONFIRMED REAL BUG caught
+        # wiring up study persistence: tune_model()'s resumable study name
+        # includes model.version, and the default BaseModelWrapper.version
+        # is the same for every model/target until this line runs. Setting
+        # it after tune_model() (as this used to) meant every real run's
+        # Optuna studies collided under one shared default-version key
+        # regardless of the actual --version tag passed on the CLI.
+        model.version = version
         hyperparameters = tune_model(
             model=model,
             features=dataset.features.iloc[train_validation_indices],
             target=dataset.target.iloc[train_validation_indices],
             categorical_columns=dataset.categorical_columns,
             n_trials=n_trials,
+            storage_path=optuna_storage_path,
         )
         model.hyperparameters = hyperparameters
-        model.version = version
         model.fit(
             dataset.features.iloc[dataset.split_indices.train_indices],
             dataset.target.iloc[dataset.split_indices.train_indices],
@@ -466,6 +475,7 @@ def run_training(
     version: str = "v1",
     n_trials: int = 20,
     target_names: list[str] | None = None,
+    optuna_storage_path: str | Path | None = None,
 ) -> list[TrainingResult]:
     """Load a matches file, build features, and train every requested target.
 
@@ -501,7 +511,13 @@ def run_training(
             )
             continue
         dataset = build_training_dataset(feature_result, target_name)
-        target_results = train_target(dataset, target_name, version=version, n_trials=n_trials)
+        target_results = train_target(
+            dataset,
+            target_name,
+            version=version,
+            n_trials=n_trials,
+            optuna_storage_path=optuna_storage_path,
+        )
         results.extend(target_results)
         best_result = _select_best_result(target_results, TARGET_TASK_MAPPING[target_name])
         LOGGER.info(
@@ -527,6 +543,17 @@ if __name__ == "__main__":
         default=None,
         help="Comma-separated subset of targets to train (default: every target in TARGET_TASK_MAPPING).",
     )
+    parser.add_argument(
+        "--optuna-storage",
+        default=None,
+        help=(
+            "Path to a SQLite file for resumable Optuna studies, keyed on "
+            "(target, model, version) -- a killed/interrupted run resumes from "
+            "its last completed trial instead of losing all progress. Defaults "
+            "to <model_artifact_dir>/optuna_studies.db; pass an empty string to "
+            "disable persistence and use an in-memory (non-resumable) study."
+        ),
+    )
     arguments = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -534,11 +561,17 @@ if __name__ == "__main__":
         Path(arguments.matches_path) if arguments.matches_path else get_settings().inference_data_path
     )
     resolved_targets = arguments.targets.split(",") if arguments.targets else None
+    resolved_optuna_storage = (
+        arguments.optuna_storage
+        if arguments.optuna_storage is not None
+        else str(get_settings().model_artifact_dir / "optuna_studies.db")
+    ) or None
 
     training_results = run_training(
         matches_path=resolved_matches_path,
         version=arguments.version,
         n_trials=arguments.n_trials,
         target_names=resolved_targets,
+        optuna_storage_path=resolved_optuna_storage,
     )
     print(f"Trained and registered {len(training_results)} model artifacts.")
