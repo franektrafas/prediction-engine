@@ -16,8 +16,11 @@ instead of being quietly presented as model output.
 
 from __future__ import annotations
 
-from datetime import date
+import math
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
+import matplotlib
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -33,15 +36,24 @@ from football_ai.narrative.team_names_pl import nominative_pl
 from football_ai.predictions.schemas import MatchContextPayload, PredictionResponse
 from football_ai.predictions.service import PredictionService
 from football_ai.scrapers.sources.elo import WorldFootballEloSource
+from football_ai.scrapers.sources.football_api import FootballApiSource
 from football_ai.scrapers.sources.uefa_nations_league import UefaNationsLeagueSource
 from football_ai.simulation.competition import (
     compute_standings,
+    simulate_final_positions,
     simulate_group_qualification,
 )
 from football_ai.simulation.fixture_input import SimulationInput, build_simulation_input
 from football_ai.simulation.scenarios import what_if_fixed_result
 
-st.set_page_config(page_title="Football AI", page_icon="⚽", layout="wide")
+# Working name -- kept in one place so renaming the product is a one-line change.
+_APP_NAME = "TRAFF STATS"
+_APP_TAGLINE = (
+    "Prognozy i konteksty meczów reprezentacji narodowych, liczone na realnych "
+    "danych historycznych — z możliwością sprawdzenia każdego faktu."
+)
+
+st.set_page_config(page_title=_APP_NAME, page_icon="⚽", layout="wide")
 
 # Kept in sync by hand with .streamlit/config.toml -- Streamlit exposes the
 # active theme only through st.get_option(), which returns None when a value
@@ -255,6 +267,118 @@ def _predictable_team_names() -> list[str]:
     return [team for team in _known_team_names() if team in elo_ratings]
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def _football_api_fixtures() -> pd.DataFrame:
+    """Upcoming fixtures from api-football.com, or an empty frame.
+
+    MEASURED, not assumed (2026-08-03, this project's own key): the free
+    plan rejects any date outside today +/- 1 ("try from 2026-08-02 to
+    2026-08-04") and blocks the `next` parameter outright, and what it does
+    return for those days is club football -- the sample came back as 1 Lyga,
+    3. Division, A Lyga and similar. National-team windows are months apart,
+    so on this plan the endpoint cannot see a single upcoming international.
+
+    Kept wired up rather than deleted because the shape of the problem is a
+    billing one: on a paid plan the same call starts returning real
+    multi-competition fixtures and the home page picks them up with no code
+    change. Everything is filtered against the engine's own known team names
+    so club sides can never leak into a national-team product.
+    """
+    settings = get_settings()
+    if not settings.football_api_key:
+        return pd.DataFrame()
+    national_team_names = set(_known_team_names())
+    collected: list[pd.DataFrame] = []
+    try:
+        source = FootballApiSource()
+        for day_offset in range(0, 3):
+            fixture_date = (date.today() + timedelta(days=day_offset)).isoformat()
+            try:
+                fixtures = source.fetch_fixtures(fixture_date=fixture_date)
+            except Exception:
+                # A rejected date is the documented free-plan behaviour, not
+                # a failure worth aborting the whole sweep for.
+                continue
+            if not fixtures.empty:
+                collected.append(fixtures)
+    except Exception:
+        return pd.DataFrame()
+    if not collected:
+        return pd.DataFrame()
+
+    fixtures = pd.concat(collected, ignore_index=True)
+    fixtures["home_team_name"] = fixtures["home_team_name"].map(canonicalize_team_name)
+    fixtures["away_team_name"] = fixtures["away_team_name"].map(canonicalize_team_name)
+    is_international = fixtures["home_team_name"].isin(national_team_names) & fixtures[
+        "away_team_name"
+    ].isin(national_team_names)
+    fixtures = fixtures.loc[is_international].copy()
+    if fixtures.empty:
+        return pd.DataFrame()
+    fixtures["tournament"] = fixtures["competition_name"].fillna(fixtures["tournament"])
+    fixtures["source_label"] = "football_api"
+    return fixtures
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _nations_league_schedule(season: str) -> pd.DataFrame:
+    """Every unplayed Nations League fixture across all four divisions.
+
+    Sixteen Wikipedia section fetches, so it is cached for half an hour --
+    the home page must never pay this per script re-run.
+    """
+    frames: list[pd.DataFrame] = []
+    for division in ("A", "B", "C", "D"):
+        for group in (1, 2, 3, 4):
+            fixtures = _nations_league_fixtures(division, group, season)
+            if fixtures.empty:
+                continue
+            unplayed = fixtures.loc[fixtures["home_score"].isna()].copy()
+            if unplayed.empty:
+                continue
+            unplayed["division"] = division
+            unplayed["group"] = group
+            frames.append(unplayed)
+    if not frames:
+        return pd.DataFrame()
+    schedule = pd.concat(frames, ignore_index=True)
+    schedule["tournament"] = "UEFA Nations League"
+    schedule["source_label"] = "wikipedia"
+    return schedule.sort_values("match_date").reset_index(drop=True)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _upcoming_fixtures(season: str) -> tuple[pd.DataFrame, bool]:
+    """All known upcoming national-team fixtures, plus whether football_api contributed.
+
+    Wikipedia's Nations League tables are the dependable source; football_api
+    is layered on when its plan actually returns internationals. The flag
+    lets the page say so discreetly instead of pretending the schedule is
+    broader than it is.
+    """
+    schedule = _nations_league_schedule(season)
+    api_fixtures = _football_api_fixtures()
+    api_contributed = not api_fixtures.empty
+    frames = [frame for frame in (schedule, api_fixtures) if not frame.empty]
+    if not frames:
+        return pd.DataFrame(), api_contributed
+    columns = [
+        "match_date",
+        "home_team_name",
+        "away_team_name",
+        "tournament",
+        "source_label",
+    ]
+    optional = ["stadium", "stadium_name", "division", "group"]
+    combined = pd.concat(
+        [frame.reindex(columns=columns + optional) for frame in frames],
+        ignore_index=True,
+    )
+    combined["match_date"] = pd.to_datetime(combined["match_date"], utc=True)
+    combined = combined.sort_values("match_date").reset_index(drop=True)
+    return combined, api_contributed
+
+
 @st.cache_data(show_spinner=False)
 def _tournaments_by_recency() -> list[str]:
     """Real competition names, most-recently-played first.
@@ -270,6 +394,28 @@ def _tournaments_by_recency() -> list[str]:
         frame.groupby("tournament")["match_date"].max().sort_values(ascending=False)
     )
     return [str(tournament) for tournament in latest.index]
+
+
+@st.cache_data(show_spinner=False)
+def _major_recent_tournaments(limit: int = 8) -> list[str]:
+    """The competitions worth putting on a filter row, busiest-first.
+
+    Deliberately *not* "most recently played": that ordering is dominated by
+    one-off invitational tournaments (Diamond Jubilee, Unity Cup, Tri-Nations
+    Cup), and measuring it showed none of the eight it produced contained a
+    single match with recorded statistics -- the stat coverage lives in World
+    Cup qualifying and the Nations League, which the recency ordering pushed
+    off the list entirely. Ranking by how many matches a competition has
+    actually played in the last two years surfaces those instead.
+    """
+    frame = _load_records_frame()
+    if frame.empty or "tournament" not in frame.columns:
+        return []
+    cutoff = frame["match_date"].max() - pd.Timedelta(days=730)
+    recent = frame.loc[frame["match_date"] >= cutoff]
+    if recent.empty:
+        return _tournaments_by_recency()[:limit]
+    return [str(name) for name in recent["tournament"].value_counts().head(limit).index]
 
 
 @st.cache_data(show_spinner=False)
@@ -365,10 +511,69 @@ def _cached_head_to_head(home: str, away: str, as_of_iso: str) -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def _cached_recent_form(team: str, as_of_iso: str, limit: int = 10) -> pd.DataFrame:
     """A team's most recent matches, oldest first, goals_for/against attached."""
-    matches = streaks.team_matches(
-        _load_records_frame(), team, pd.Timestamp(as_of_iso)
-    )
+    matches = streaks.team_matches(_load_records_frame(), team, pd.Timestamp(as_of_iso))
     return matches.tail(limit)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_goal_minute_profile(
+    team: str, as_of_iso: str, n_matches: int = 20
+) -> pd.DataFrame:
+    """Goals scored and conceded per 15-minute band over a team's last N matches.
+
+    Built because Krok 0 measured `minute` at 99.5% coverage overall and
+    100% across the last five years -- unlike the per-match stat columns,
+    which sit at 14.8% and are handled conditionally instead.
+    """
+    records = _load_records_frame()
+    goalscorers = _load_goalscorers_frame()
+    as_of = pd.Timestamp(as_of_iso)
+    recent = streaks.team_matches(records, team, as_of).tail(n_matches)
+    bands = ["1-15", "16-30", "31-45", "46-60", "61-75", "76-90+"]
+    empty = pd.DataFrame({"band": bands, "scored": [0] * 6, "conceded": [0] * 6})
+    if recent.empty or goalscorers.empty or "minute" not in goalscorers.columns:
+        return empty
+
+    canonical = canonicalize_team_name(team)
+    goals = goalscorers.loc[
+        goalscorers["match_id"].isin(set(recent["match_id"]))
+    ].copy()
+    goals = goals.loc[goals["minute"].notna()]
+    if goals.empty:
+        return empty
+
+    # An own goal is credited to the scorer's own team in this source, so the
+    # side that actually benefits is the opponent -- flip it before counting,
+    # otherwise a team's "scored" profile quietly includes its own mistakes.
+    scoring_team = goals.apply(
+        lambda row: (
+            (
+                row["away_team_name"]
+                if row["team_name"] == row["home_team_name"]
+                else row["home_team_name"]
+            )
+            if bool(row.get("own_goal"))
+            else row["team_name"]
+        ),
+        axis=1,
+    )
+    band_index = (
+        (
+            (pd.to_numeric(goals["minute"], errors="coerce").fillna(0).clip(1, 90) - 1)
+            // 15
+        )
+        .clip(0, 5)
+        .astype(int)
+    )
+    scored_counts = band_index.loc[scoring_team == canonical].value_counts()
+    conceded_counts = band_index.loc[scoring_team != canonical].value_counts()
+    return pd.DataFrame(
+        {
+            "band": bands,
+            "scored": [int(scored_counts.get(index, 0)) for index in range(6)],
+            "conceded": [int(conceded_counts.get(index, 0)) for index in range(6)],
+        }
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -525,7 +730,7 @@ def _format_provenance_row(record: dict[str, object]) -> str:
 
 
 def _format_date_header_pl(day: date) -> str:
-    """"Czwartek, 24 września" -- Polish weekday + genitive month, built by hand.
+    """Format a date as "Czwartek, 24 września" -- weekday plus genitive month.
 
     Not `locale`/`babel`: neither is a dependency here and `setlocale` is
     process-global, so a Streamlit worker changing it would leak into every
@@ -533,6 +738,116 @@ def _format_date_header_pl(day: date) -> str:
     """
     month = _MONTHS_GENITIVE_PL[day.month - 1]
     return f"{_WEEKDAYS_PL[day.weekday()]}, {day.day} {month}"
+
+
+def _heatmap_figure(
+    matrix: list[list[float]],
+    x_labels: list[str],
+    y_labels: list[str],
+    cell_texts: list[list[str]],
+    height: int,
+) -> go.Figure:
+    """A single-hue heat map with every value also written into its cell.
+
+    One colour family from light to dark rather than a rainbow scale: a
+    rainbow implies unordered categories and is unreadable with common
+    colour-vision deficiencies. The number is always drawn as text too, so
+    colour never carries information on its own, and the text flips to a
+    light shade above the midpoint so it stays legible on dark cells.
+    """
+    peak = max((value for row in matrix for value in row), default=0.0)
+    annotations = []
+    for row_index, row in enumerate(matrix):
+        for column_index, value in enumerate(row):
+            is_dark_cell = peak > 0 and value / peak > 0.55
+            annotations.append(
+                dict(
+                    x=x_labels[column_index],
+                    y=y_labels[row_index],
+                    text=cell_texts[row_index][column_index],
+                    showarrow=False,
+                    font=dict(
+                        color="#f2ede0" if is_dark_cell else "#20242c",
+                        size=12,
+                        family="Georgia, serif",
+                    ),
+                )
+            )
+    figure = go.Figure(
+        go.Heatmap(
+            z=matrix,
+            x=x_labels,
+            y=y_labels,
+            colorscale=[[0.0, "#f0ead9"], [0.5, "#c9a227"], [1.0, "#5c4a12"]],
+            showscale=False,
+            hoverinfo="skip",
+            xgap=2,
+            ygap=2,
+        )
+    )
+    figure.update_layout(annotations=annotations)
+    figure.update_yaxes(autorange="reversed")
+    return _style_figure(figure, height=height)
+
+
+def _score_grid_figure(
+    home_label: str,
+    away_label: str,
+    home_goals: float,
+    away_goals: float,
+    max_goals: int = 5,
+) -> tuple[go.Figure, list[tuple[str, float]], float]:
+    """Exact-scoreline probabilities as a grid, from independent Poisson sides.
+
+    The same distributional assumption `simulation/monte_carlo.py` already
+    simulates from, just evaluated analytically instead of sampled. Replaces
+    a single "predicted score", which reads as a confident call the model
+    never actually makes -- the grid shows how flat the real distribution is.
+
+    Also returns the three likeliest scorelines and the probability mass
+    outside the grid, so the caption can state honestly how much isn't shown.
+    """
+    home_lambda = max(float(home_goals), 1e-6)
+    away_lambda = max(float(away_goals), 1e-6)
+    home_pmf = [_poisson_pmf(home_lambda, count) for count in range(max_goals + 1)]
+    away_pmf = [_poisson_pmf(away_lambda, count) for count in range(max_goals + 1)]
+    matrix = [
+        [
+            home_pmf[home_count] * away_pmf[away_count]
+            for away_count in range(max_goals + 1)
+        ]
+        for home_count in range(max_goals + 1)
+    ]
+    inside_mass = sum(value for row in matrix for value in row)
+
+    scorelines = [
+        (f"{home_count}:{away_count}", matrix[home_count][away_count])
+        for home_count in range(max_goals + 1)
+        for away_count in range(max_goals + 1)
+    ]
+    top_scorelines = sorted(scorelines, key=lambda item: -item[1])[:3]
+
+    figure = _heatmap_figure(
+        matrix=matrix,
+        x_labels=[str(count) for count in range(max_goals + 1)],
+        y_labels=[str(count) for count in range(max_goals + 1)],
+        cell_texts=[
+            [f"{value:.0%}" if value >= 0.005 else "" for value in row]
+            for row in matrix
+        ],
+        height=420,
+    )
+    figure.update_layout(
+        xaxis_title=f"Bramki: {away_label}",
+        yaxis_title=f"Bramki: {home_label}",
+        xaxis=dict(showgrid=False, zeroline=False, side="top"),
+    )
+    return figure, top_scorelines, 1.0 - inside_mass
+
+
+def _poisson_pmf(expected: float, count: int) -> float:
+    """P(exactly `count`) for Poisson(`expected`), without pulling in scipy."""
+    return math.exp(-expected) * expected**count / math.factorial(count)
 
 
 def _plural_pl(count: int, one: str, few: str, many: str) -> str:
@@ -573,6 +888,63 @@ def _form_markers_html(letters: list[str]) -> str:
     return f"<div style='display:flex;flex-wrap:wrap'>{''.join(markers)}</div>"
 
 
+def _head_to_head_summary(home: str, away: str, as_of: pd.Timestamp) -> str:
+    """One-sentence head-to-head record, shared by the screen and the PDF."""
+    meetings = _cached_head_to_head(home, away, as_of.isoformat())
+    home_label = nominative_pl(home)
+    away_label = nominative_pl(away)
+    if meetings.empty:
+        return f"{home_label} i {away_label} nigdy dotąd ze sobą nie grały."
+    counts = meetings["team_a_result"].value_counts()
+    wins = int(counts.get("win", 0))
+    draws = int(counts.get("draw", 0))
+    losses = int(counts.get("loss", 0))
+    return (
+        f"{len(meetings)} "
+        f"{_plural_pl(len(meetings), 'spotkanie', 'spotkania', 'spotkań')} · "
+        f"z perspektywy {home_label}: "
+        f"{wins} {_plural_pl(wins, 'zwycięstwo', 'zwycięstwa', 'zwycięstw')}, "
+        f"{draws} {_plural_pl(draws, 'remis', 'remisy', 'remisów')}, "
+        f"{losses} {_plural_pl(losses, 'porażka', 'porażki', 'porażek')}."
+    )
+
+
+def _render_goal_minute_profile(home: str, away: str, as_of: pd.Timestamp) -> None:
+    """When each side scores and concedes, in 15-minute bands.
+
+    Built on `goalscorers.minute`, measured at 99.5% coverage overall and
+    100% over the last five years -- the one rich column in this dataset.
+    """
+    rows: list[list[float]] = []
+    labels: list[str] = []
+    texts: list[list[str]] = []
+    for team in (home, away):
+        profile = _cached_goal_minute_profile(team, as_of.isoformat())
+        if profile[["scored", "conceded"]].to_numpy().sum() == 0:
+            continue
+        team_label = nominative_pl(team)
+        for column, suffix in (("scored", "strzelone"), ("conceded", "stracone")):
+            rows.append([float(value) for value in profile[column]])
+            labels.append(f"{team_label} — {suffix}")
+            texts.append([str(int(value)) for value in profile[column]])
+    if not rows:
+        st.caption("Brak danych o minutach goli dla tych drużyn.")
+        return
+    st.plotly_chart(
+        _heatmap_figure(
+            matrix=rows,
+            x_labels=list(_cached_goal_minute_profile(home, as_of.isoformat())["band"]),
+            y_labels=labels,
+            cell_texts=texts,
+            height=90 + 46 * len(rows),
+        ),
+        width="stretch",
+    )
+    st.caption(
+        "Gole z ostatnich 20 meczów każdej drużyny, w przedziałach 15-minutowych."
+    )
+
+
 def _render_head_to_head(home: str, away: str, as_of: pd.Timestamp) -> None:
     """W/D/L balance from the home team's side, plus the last five meetings."""
     meetings = _cached_head_to_head(home, away, as_of.isoformat())
@@ -603,7 +975,7 @@ def _render_head_to_head(home: str, away: str, as_of: pd.Timestamp) -> None:
         pd.DataFrame(
             [
                 {
-                    "Data": pd.Timestamp(row["match_date"]).date(),
+                    "Data": str(pd.Timestamp(row["match_date"]).date()),
                     "Wynik": (
                         f"{nominative_pl(str(row['home_team_name']))} "
                         f"{int(row['home_score'])}:{int(row['away_score'])} "
@@ -616,6 +988,9 @@ def _render_head_to_head(home: str, away: str, as_of: pd.Timestamp) -> None:
         ),
         width="stretch",
         hide_index=True,
+        # Without an explicit width the long "Wynik" string squeezes the date
+        # column until it renders as "2024-0".
+        column_config={"Data": st.column_config.TextColumn(width="small")},
     )
 
 
@@ -681,6 +1056,9 @@ def _render_structural_context(home: str, away: str, as_of: pd.Timestamp) -> Non
             _render_team_form(home, as_of)
         with away_column:
             _render_team_form(away, as_of)
+        st.divider()
+        st.markdown("**Kiedy padają gole**")
+        _render_goal_minute_profile(home, away, as_of)
 
 
 def _render_facts(facts: list[Fact]) -> None:
@@ -782,49 +1160,120 @@ def _render_match_context(prediction: PredictionResponse) -> None:
             columns[index % len(columns)].metric(label, display)
 
 
-def _prediction_export_text(
+def _unicode_font_path() -> Path:
+    """A TTF with full Polish coverage, taken from matplotlib's own bundle.
+
+    matplotlib is already a hard dependency of this project, and it ships
+    DejaVuSans -- so the PDF gets real "ś/ż/ó" on any machine that can run
+    the app, with no system-font lookup (which would break the moment this
+    is deployed to a Linux container) and no binary committed to the repo.
+    fpdf's built-in fonts are Latin-1 only and would render them as blanks.
+    """
+    return Path(matplotlib.get_data_path()) / "fonts" / "ttf" / "DejaVuSans.ttf"
+
+
+def _build_analysis_pdf(
     home_label: str,
     away_label: str,
     match_date: date,
+    tournament: str,
     prediction: PredictionResponse,
     facts: list[Fact],
-) -> str:
-    """Ready-to-paste Markdown -- the product is sentences, so they must copy."""
+    head_to_head_summary: str,
+    top_scorelines: list[tuple[str, float]],
+) -> bytes:
+    """One-page PDF of the analysis on screen, for sending on to an editor."""
+    from fpdf import FPDF
+
+    document = FPDF(format="A4")
+    document.set_auto_page_break(auto=True, margin=16)
+    document.add_page()
+    font_path = str(_unicode_font_path())
+    document.add_font("DejaVu", "", font_path)
+    document.add_font(
+        "DejaVu", "B", str(font_path).replace("DejaVuSans", "DejaVuSans-Bold")
+    )
+
+    def write(text: str, size: float = 10, style: str = "", gap: float = 5.5) -> None:
+        document.set_font("DejaVu", style, size)
+        # Explicit new_x/new_y: fpdf2's default leaves the cursor at the right
+        # edge of the cell it just drew, so the next full-width multi_cell has
+        # zero space left and raises "Not enough horizontal space".
+        document.multi_cell(0, gap, text, new_x="LMARGIN", new_y="NEXT")
+
+    write(_APP_NAME, size=9, style="B", gap=5)
+    write(f"{home_label} — {away_label}", size=17, style="B", gap=9)
+    write(f"{match_date} · {tournament}", size=9)
+    document.ln(2)
+
     outcome = prediction.outcome_probabilities
-    score = f"{prediction.exact_score['home']}:{prediction.exact_score['away']}"
-    expected_goals = f"{prediction.xg['home']:.2f} — {prediction.xg['away']:.2f}"
-    lines = [
-        f"# {home_label} — {away_label} ({match_date})",
-        "",
-        "## Prognoza",
-        f"- Wygrana {home_label}: {outcome.home_win:.0%}",
-        f"- Remis: {outcome.draw:.0%}",
-        f"- Wygrana {away_label}: {outcome.away_win:.0%}",
-        f"- Przewidywany wynik: {score}",
-        f"- Oczekiwane bramki (xG): {expected_goals}",
-        f"- Obie drużyny strzelą: {prediction.btts:.0%}",
-        f"- Powyżej 2.5 bramki: {prediction.over_under['over_2_5']:.0%}",
-        "",
-        "## Fakty historyczne",
-    ]
-    if facts:
-        lines.extend(f"- {render_fact(fact)}" for fact in facts)
-    else:
-        lines.append("- (brak faktów historycznych dla tej pary)")
-    return "\n".join(lines)
-
-
-def _render_export(file_stem: str, text: str) -> None:
-    """st.code has a built-in copy button; download covers the paste-into-CMS case."""
-    with st.container(border=True):
-        st.subheader("Tekst do publikacji")
-        st.code(text, language="markdown")
-        st.download_button(
-            "Pobierz jako .md",
-            data=text.encode("utf-8"),
-            file_name=f"{file_stem}.md",
-            mime="text/markdown",
+    write("Prognoza", size=12, style="B", gap=7)
+    write(
+        f"Wygrana {home_label}: {outcome.home_win:.0%}    "
+        f"Remis: {outcome.draw:.0%}    "
+        f"Wygrana {away_label}: {outcome.away_win:.0%}"
+    )
+    write(
+        f"Oczekiwane bramki (xG): {prediction.xg['home']:.2f} — "
+        f"{prediction.xg['away']:.2f}    "
+        f"Obie drużyny strzelą: {prediction.btts:.0%}    "
+        f"Powyżej 2.5: {prediction.over_under['over_2_5']:.0%}"
+    )
+    if top_scorelines:
+        likeliest = "    ".join(
+            f"{score} ({value:.0%})" for score, value in top_scorelines
         )
+        write(f"Najbardziej prawdopodobne wyniki: {likeliest}")
+    document.ln(2)
+
+    write("Bilans bezpośredni", size=12, style="B", gap=7)
+    write(head_to_head_summary)
+    document.ln(2)
+
+    write("Statystyki meczowe (prognoza)", size=12, style="B", gap=7)
+    for label, home_value, away_value in (
+        ("Rzuty rożne", prediction.corners["home"], prediction.corners["away"]),
+        ("Żółte kartki", prediction.cards["home"], prediction.cards["away"]),
+        ("Strzały", prediction.shots["home"], prediction.shots["away"]),
+        (
+            "Strzały celne",
+            prediction.shots_on_target["home"],
+            prediction.shots_on_target["away"],
+        ),
+        (
+            "Posiadanie (%)",
+            prediction.possession["home"],
+            prediction.possession["away"],
+        ),
+    ):
+        write(f"{label}: {home_value:.1f} — {away_value:.1f}")
+    document.ln(2)
+
+    write("Nietypowe fakty", size=12, style="B", gap=7)
+    if facts:
+        lookup = _match_lookup()
+        for fact in facts:
+            write(f"• {render_fact(fact)}")
+            sources = [
+                _format_provenance_row(lookup[match_id])
+                for match_id in fact.provenance
+                if match_id in lookup
+            ][:3]
+            if sources:
+                write("    źródło: " + "; ".join(sources), size=7.5, gap=4.5)
+    else:
+        write("• (brak faktów historycznych dla tej pary)")
+
+    document.ln(4)
+    generated_at = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+    write(
+        f"Wygenerowano {generated_at} przez {_APP_NAME}. Liczby pochodzą z modelu "
+        "statystycznego uczonego na historycznych wynikach — nie są kursem ani "
+        "zakładem bukmacherskim.",
+        size=7.5,
+        gap=4,
+    )
+    return bytes(document.output())
 
 
 def _team_picker(
@@ -871,10 +1320,47 @@ def _team_picker(
 # --------------------------------------------------------------------------
 
 
+def _select_recap(match_id: int) -> None:
+    """Open one played match's recap -- `on_click` callback, see `_select_fixture`."""
+    st.session_state["recap_result"] = match_id
+
+
+def _clear_recap() -> None:
+    """Return to the results list."""
+    st.session_state.pop("recap_result", None)
+
+
+def _clear_fixture() -> None:
+    """Return to the fixture list."""
+    st.session_state.pop("selected_fixture", None)
+
+
 def _select_fixture(home: str, away: str, match_date: date, tournament: str) -> None:
-    """Move to the analysis screen for one fixture."""
+    """Move to the analysis screen for one fixture.
+
+    Used as an `on_click` callback, never called inline: a callback runs
+    *before* the script re-executes, so the new screen renders on the very
+    next pass without an explicit `st.rerun()`. That matters because
+    `st.rerun()` resets `st.tabs` to the first tab -- clicking a match in the
+    "Po meczu" tab used to bounce the user back to "Nadchodzące mecze".
+    """
     st.session_state["selected_fixture"] = (home, away, match_date, tournament)
-    st.rerun()
+
+
+def _fixture_left_label(row: pd.Series) -> str:
+    """Kick-off time when the source really has one, otherwise the venue.
+
+    Wikipedia's Nations League tables carry a date with no time (verified:
+    every timestamp is exactly 00:00), so showing "00:00" there would be an
+    invented kick-off. football_api rows do carry a real time.
+    """
+    timestamp = pd.Timestamp(row["match_date"])
+    if timestamp.hour or timestamp.minute:
+        return timestamp.strftime("%H:%M")
+    venue = row.get("stadium") if "stadium" in row.index else None
+    if not venue and "stadium_name" in row.index:
+        venue = row.get("stadium_name")
+    return str(venue) if venue and not pd.isna(venue) else "—"
 
 
 def _render_fixture_card(
@@ -883,13 +1369,12 @@ def _render_fixture_card(
     """One fixture as a full-width, visibly clickable card."""
     home = str(row["home_team_name"])
     away = str(row["away_team_name"])
+    tournament = str(row.get("tournament") or "UEFA Nations League")
     with st.container(border=True):
-        venue_column, teams_column, action_column = st.columns([2, 3, 2])
-        with venue_column:
-            # The Wikipedia fixture tables carry a date but no kick-off time
-            # (verified: every timestamp is exactly 00:00), so this shows the
-            # real venue rather than inventing an hour.
-            st.caption(str(row.get("stadium") or "—"))
+        left_column, teams_column, action_column = st.columns([2, 3, 2])
+        with left_column:
+            st.caption(_fixture_left_label(row))
+            st.caption(tournament)
         with teams_column:
             st.markdown(f"**{nominative_pl(home)}**  \n**{nominative_pl(away)}**")
         with action_column:
@@ -900,13 +1385,55 @@ def _render_fixture_card(
                 if home_elo and away_elo
                 else "Elo: brak"
             )
-            if st.button("Analiza", key=key, width="stretch"):
-                _select_fixture(
-                    home,
-                    away,
-                    pd.Timestamp(row["match_date"]).date(),
-                    "UEFA Nations League",
-                )
+            st.button(
+                "Analiza",
+                key=key,
+                width="stretch",
+                on_click=_select_fixture,
+                args=(home, away, pd.Timestamp(row["match_date"]).date(), tournament),
+            )
+
+
+def _render_competition_filter(options: list[str], key: str) -> str:
+    """The shared "Filtruj rozgrywki" control -- identical on both screens.
+
+    The choice is mirrored into a plain session_state key because Streamlit
+    discards a widget's own state on any run where the widget isn't rendered,
+    and the detail screens render none of these -- without the mirror, going
+    back to a list always snapped the filter to "Wszystkie".
+    """
+    memory_key = f"{key}_choice"
+    choice = st.segmented_control(
+        "Filtruj rozgrywki",
+        ["Wszystkie", *options],
+        default=st.session_state.get(memory_key, "Wszystkie"),
+        key=key,
+    )
+    resolved = choice or "Wszystkie"
+    st.session_state[memory_key] = resolved
+    return resolved
+
+
+def _render_result_card(row: pd.Series, key: str) -> None:
+    """A played match: same shape as a fixture card, but the score replaces the time."""
+    home = str(row["home_team_name"])
+    away = str(row["away_team_name"])
+    with st.container(border=True):
+        score_column, teams_column, action_column = st.columns([2, 3, 2])
+        with score_column:
+            st.markdown(f"### {int(row['home_score'])} : {int(row['away_score'])}")
+            st.caption(str(row.get("tournament") or ""))
+        with teams_column:
+            st.markdown(f"**{nominative_pl(home)}**  \n**{nominative_pl(away)}**")
+        with action_column:
+            st.caption(str(pd.Timestamp(row["match_date"]).date()))
+            st.button(
+                "Podsumowanie",
+                key=key,
+                width="stretch",
+                on_click=_select_recap,
+                args=(int(row["match_id"]),),
+            )
 
 
 def _render_manual_pair_expander() -> None:
@@ -936,62 +1463,81 @@ def _render_manual_pair_expander() -> None:
 
 
 def _render_fixture_list() -> None:
-    """Screen 1: every scheduled match of one group, grouped by date."""
-    # Streamlit drops a widget's session_state entry on any run where that
-    # widget isn't rendered -- and the analysis screen renders none of these.
-    # Without mirroring the choice into plain (non-widget) keys, coming back
-    # from an analysis always snapped the list to the defaults instead of the
-    # group the user was actually looking at.
-    division = st.segmented_control(
-        "Dywizja",
-        ["A", "B", "C", "D"],
-        default=st.session_state.get("division_choice", "B"),
-        key="preview_division",
-    )
-    group = st.segmented_control(
-        "Grupa",
-        [1, 2, 3, 4],
-        default=st.session_state.get("group_choice", 4),
-        key="preview_group",
-    )
+    """Screen 1: the next upcoming matches, newest competition filter on top."""
     with st.expander("Ustawienia", expanded=False):
+        # Streamlit drops a widget's session_state entry on any run where the
+        # widget isn't rendered, and the analysis screen renders none of
+        # these -- mirroring into plain keys keeps the choice across screens.
         season = st.text_input(
-            "Sezon",
+            "Sezon Ligi Narodów",
             value=st.session_state.get("season_choice", "2026–27"),
             key="preview_season",
         )
-    if division is None or group is None:
-        st.caption("Wybierz dywizję i grupę.")
-        return
-    st.session_state["division_choice"] = division
-    st.session_state["group_choice"] = group
     st.session_state["season_choice"] = season
 
     with st.spinner("Pobieram terminarz..."):
-        fixtures = _nations_league_fixtures(str(division), int(group), season)
-    if fixtures.empty:
+        schedule, api_contributed = _upcoming_fixtures(season)
+
+    if schedule.empty:
         st.warning(
-            f"Nie udało się pobrać terminarza dla dywizji {division}, grupy {group} "
-            f"({season}). Sprawdź sezon albo użyj „Dowolna para”."
+            f"Nie udało się pobrać żadnego terminarza (sezon {season}). "
+            "Sprawdź sezon w ustawieniach albo użyj „Dowolna para”."
         )
         _render_manual_pair_expander()
         return
 
-    upcoming = fixtures.loc[fixtures["home_score"].isna()]
-    if upcoming.empty:
-        st.info(
-            "W tej grupie wszystkie mecze zostały już rozegrane "
-            "— zobacz zakładkę „Po meczu”."
-        )
+    competitions = sorted(schedule["tournament"].dropna().unique())
+    selected = _render_competition_filter(list(competitions), key="home_competition")
+    filtered = (
+        schedule
+        if selected == "Wszystkie"
+        else schedule.loc[schedule["tournament"] == selected]
+    )
+
+    # Team filter drawn from the schedule itself, not from every team that ever
+    # played: offering a side with no upcoming fixture would only ever lead to
+    # an empty list.
+    scheduled_teams = sorted(
+        set(filtered["home_team_name"].dropna())
+        | set(filtered["away_team_name"].dropna())
+    )
+    selected_team = st.selectbox(
+        "Filtruj drużynę",
+        ["Wszystkie", *scheduled_teams],
+        format_func=lambda name: (
+            "Wszystkie" if name == "Wszystkie" else nominative_pl(name)
+        ),
+        key="home_team_filter",
+    )
+    if selected_team != "Wszystkie":
+        filtered = filtered.loc[
+            (filtered["home_team_name"] == selected_team)
+            | (filtered["away_team_name"] == selected_team)
+        ]
+
+    if filtered.empty:
+        label = selected if selected != "Wszystkie" else "wybranych filtrów"
+        if selected_team != "Wszystkie":
+            label = nominative_pl(selected_team)
+        st.info(f"Brak nadchodzących spotkań dla {label}.")
         _render_manual_pair_expander()
         return
 
+    if not api_contributed:
+        st.caption(
+            "Terminarz pochodzi z Ligi Narodów (Wikipedia). Rozszerzenie o inne "
+            "rozgrywce wymaga płatnego planu api-football — obecny plan nie "
+            "udostępnia dat poza dzisiejszą."
+        )
+
+    upcoming = filtered.head(10)
     elo_ratings = _load_elo_ratings()
     fixtures_by_day = upcoming.groupby(upcoming["match_date"].dt.date, sort=True)
     for day, day_fixtures in fixtures_by_day:
         st.markdown(f"##### {_format_date_header_pl(day)}")
-        for position, (_, row) in enumerate(day_fixtures.iterrows()):
-            _render_fixture_card(row, elo_ratings, key=f"fixture_{day}_{position}")
+        for _, row in day_fixtures.iterrows():
+            fixture_key = f"{row['home_team_name']}_{row['away_team_name']}_{day}"
+            _render_fixture_card(row, elo_ratings, key=f"fixture_{fixture_key}")
 
     _render_manual_pair_expander()
 
@@ -1003,11 +1549,11 @@ def _render_match_preview_tab() -> None:
         _render_fixture_list()
         return
 
-    if st.button("← Wszystkie mecze grupy", key="preview_back"):
-        # Only the selection is cleared -- division/group/season live under
-        # their own widget keys, so the list comes back exactly as it was.
-        del st.session_state["selected_fixture"]
-        st.rerun()
+    # Only the selection is cleared -- the season lives under its own mirrored
+    # key, so the list comes back exactly as it was.
+    st.button("← Wszystkie mecze", key="preview_back", on_click=_clear_fixture)
+    if st.session_state.get("selected_fixture") is None:
+        return
 
     home, away, match_date, tournament = stored
 
@@ -1023,7 +1569,12 @@ def _render_match_preview_tab() -> None:
     st.header(f"{home_label} — {away_label}")
     st.caption(f"{match_date} · {tournament}")
 
+    _warn_on_missing_elo(home, away)
     _render_structural_context(home, away, pd.Timestamp(match_date, tz="UTC"))
+
+    score_figure, top_scorelines, tail_mass = _score_grid_figure(
+        home_label, away_label, prediction.goals["home"], prediction.goals["away"]
+    )
 
     with st.container(border=True):
         st.subheader("Prognoza wyniku")
@@ -1033,14 +1584,24 @@ def _render_match_preview_tab() -> None:
             ),
             width="stretch",
         )
-        score_column, xg_column = st.columns(2)
-        score_column.metric(
-            "Przewidywany wynik",
-            f"{prediction.exact_score['home']} : {prediction.exact_score['away']}",
-        )
-        xg_column.metric(
+        st.metric(
             "Oczekiwane bramki (xG)",
             f"{prediction.xg['home']:.2f} : {prediction.xg['away']:.2f}",
+        )
+
+    with st.container(border=True):
+        # Replaces a single "predicted score". One scoreline reads as a
+        # confident call the model never makes -- the likeliest cell here is
+        # typically only ~10%, which the grid shows and a metric hides.
+        st.subheader("Prawdopodobieństwo dokładnego wyniku")
+        st.plotly_chart(score_figure, width="stretch")
+        likeliest = " · ".join(
+            f"**{score}** {value:.0%}" for score, value in top_scorelines
+        )
+        st.markdown(f"Najbardziej prawdopodobne: {likeliest}")
+        st.caption(
+            f"Siatka pokrywa 0–5 bramek każdej drużyny; poza nią pozostaje "
+            f"{tail_mass:.1%} prawdopodobieństwa (wyniki z 6+ bramkami)."
         )
 
     with st.container(border=True):
@@ -1090,9 +1651,7 @@ def _render_match_preview_tab() -> None:
     # Head-to-head and streak facts already appear as structured context
     # above, so they're dropped here rather than repeated -- what's left is
     # genuinely the trivia this section claims to be.
-    trivia = [
-        fact for fact in facts if fact.fact_type not in _STRUCTURAL_FACT_TYPES
-    ]
+    trivia = [fact for fact in facts if fact.fact_type not in _STRUCTURAL_FACT_TYPES]
     with st.container(border=True):
         st.subheader("Nietypowe fakty")
         st.caption(
@@ -1102,16 +1661,226 @@ def _render_match_preview_tab() -> None:
         _render_facts(trivia)
 
     _render_match_context(prediction)
-    _render_export(
-        f"{home}-{away}-{match_date}",
-        _prediction_export_text(home_label, away_label, match_date, prediction, trivia),
-    )
+    _render_group_outlook_link(home, away, tournament)
     _render_diagnostics(prediction)
+
+
+def _warn_on_missing_elo(home: str, away: str) -> None:
+    """Say so when a side has no Elo rating, instead of quietly guessing.
+
+    The manual picker already excludes ratingless teams, but a real fixture
+    from the schedule can still involve one (e.g. an ASEAN Championship side
+    eloratings.net doesn't track). Without a rating the model receives NaN,
+    its imputer substitutes the training median, and it then reasons about
+    that team as an average national side -- the same mechanism that once
+    produced "Panjab 54% to beat Sweden". Better to flag it on the screen
+    than to present the number as if it were on equal footing.
+    """
+    elo_ratings = _load_elo_ratings()
+    if not elo_ratings:
+        return
+    missing = [
+        nominative_pl(team)
+        for team in (home, away)
+        if canonicalize_team_name(team) not in elo_ratings
+    ]
+    if not missing:
+        return
+    st.warning(
+        f"Brak aktualnego rankingu Elo dla: {', '.join(missing)}. Model zastępuje "
+        "go wartością typową dla przeciętnej reprezentacji, więc tę prognozę należy "
+        "traktować z dużą ostrożnością."
+    )
+
+
+def _render_group_outlook_link(home: str, away: str, tournament: str) -> None:
+    """Jump to the group simulation, but only when this match is really in a group.
+
+    A friendly belongs to no group, so rather than showing a disabled
+    control the button simply isn't rendered.
+    """
+    if "nations league" not in tournament.lower():
+        return
+    location = _find_nations_league_group(
+        home, away, st.session_state.get("season_choice", "2026–27")
+    )
+    if location is None:
+        return
+    division, group = location
+    if st.button(
+        f"Zobacz perspektywy grupy (dywizja {division}, grupa {group})",
+        key="preview_to_outlook",
+    ):
+        st.session_state["outlook_division"] = division
+        st.session_state["outlook_group"] = group
+        st.session_state["outlook_autorun"] = True
+        st.rerun()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _find_nations_league_group(
+    home: str, away: str, season: str
+) -> tuple[str, int] | None:
+    """Which Nations League division/group this pairing belongs to, if any."""
+    schedule = _nations_league_schedule(season)
+    if schedule.empty or "division" not in schedule.columns:
+        return None
+    match = schedule.loc[
+        (schedule["home_team_name"] == home) & (schedule["away_team_name"] == away)
+    ]
+    if match.empty:
+        return None
+    row = match.iloc[0]
+    return str(row["division"]), int(row["group"])
 
 
 # --------------------------------------------------------------------------
 # Tab 2: post-match recap
 # --------------------------------------------------------------------------
+
+
+@st.cache_data(show_spinner=False)
+def _recent_results(
+    tournament: str | None, team: str | None, limit: int = 10
+) -> pd.DataFrame:
+    """The most recent played matches, optionally narrowed by competition and/or team.
+
+    Both filters are independent and optional: neither gives the latest
+    matches overall, one gives that slice, both give the intersection. A
+    plain filter over `records_frame` -- no new data source involved.
+    """
+    frame = _load_records_frame()
+    if frame.empty:
+        return frame
+    if tournament:
+        frame = frame.loc[frame["tournament"] == tournament]
+    if team:
+        canonical = canonicalize_team_name(team)
+        frame = frame.loc[
+            (frame["home_team_name"] == canonical)
+            | (frame["away_team_name"] == canonical)
+        ]
+    return (
+        frame.sort_values("match_date", ascending=False)
+        .head(limit)
+        .reset_index(drop=True)
+    )
+
+
+def _render_recent_results_list(tournaments: list[str]) -> None:
+    """Screen 1 of the recap tab: recently played matches, with two optional filters."""
+    # The historical record spans ~100 competitions, and offering every one
+    # buried the match list under ten rows of buttons. Capped to the most
+    # recently played, and said out loud rather than silently truncated --
+    # the team filter still reaches everything older.
+    shortlist = _major_recent_tournaments() or tournaments[:8]
+    selected_tournament = _render_competition_filter(
+        shortlist, key="recap_competition"
+    )
+    if len(tournaments) > len(shortlist):
+        st.caption(
+            f"Pokazano {len(shortlist)} najnowszych rozgrywek z {len(tournaments)} "
+            "w zbiorze — starsze znajdziesz przez filtr drużyny."
+        )
+    teams = _known_team_names()
+    selected_team = st.selectbox(
+        "Filtruj drużynę",
+        ["Wszystkie", *teams],
+        format_func=lambda name: (
+            "Wszystkie" if name == "Wszystkie" else nominative_pl(name)
+        ),
+        key="recap_team",
+    )
+
+    matches = _recent_results(
+        None if selected_tournament == "Wszystkie" else selected_tournament,
+        None if selected_team == "Wszystkie" else selected_team,
+    )
+    if matches.empty:
+        label = (
+            selected_tournament
+            if selected_tournament != "Wszystkie"
+            else "wybranych filtrów"
+        )
+        st.info(f"Brak rozegranych spotkań dla {label}.")
+        return
+
+    results_by_day = matches.groupby(matches["match_date"].dt.date, sort=False)
+    for day, day_matches in results_by_day:
+        st.markdown(f"##### {_format_date_header_pl(day)}")
+        for _, row in day_matches.iterrows():
+            # Keyed on match_id, never on position: the list changes shape when
+            # a filter changes, and a positional key would then bind the same
+            # widget to a different match -- clicking one row opened another.
+            _render_result_card(row, key=f"result_{int(row['match_id'])}")
+
+
+def _render_match_statistics(
+    match_row: pd.Series, home_label: str, away_label: str
+) -> None:
+    """Real recorded stats for this match -- only the ones that actually exist.
+
+    Krok 0 measured these columns at 14.8% coverage over the last five years
+    (1.7% overall), so they are rendered per match and never as a fixed block
+    of "brak danych" rows: a match either has them or the section says so in
+    one sentence.
+    """
+    available = [
+        (label, float(match_row[f"home_{column}"]), float(match_row[f"away_{column}"]))
+        for label, column in (
+            ("Strzały", "shots"),
+            ("Strzały celne", "shots_on_target"),
+            ("Rzuty rożne", "corners"),
+            ("Posiadanie (%)", "possession_pct"),
+            ("Żółte kartki", "yellow_cards"),
+            ("Czerwone kartki", "red_cards"),
+            ("Faule", "fouls_committed"),
+            ("Spalone", "offsides"),
+            ("Obrony", "saves"),
+            ("Podania", "total_passes"),
+        )
+        if f"home_{column}" in match_row.index
+        and pd.notna(match_row.get(f"home_{column}"))
+        and pd.notna(match_row.get(f"away_{column}"))
+    ]
+    with st.container(border=True):
+        st.subheader("Statystyki meczowe")
+        if not available:
+            st.caption(
+                "Brak zapisanych statystyk dla tego meczu — szczegółowe dane "
+                "statystyczne są dostępne głównie dla nowszych spotkań."
+            )
+            return
+        st.plotly_chart(
+            _team_comparison_chart(home_label, away_label, available), width="stretch"
+        )
+
+
+def _render_goalscorers(match_id: int, home_team: str, away_team: str) -> None:
+    """Chronological goal list with minute, penalty and own-goal markers."""
+    goalscorers = _load_goalscorers_frame()
+    if goalscorers.empty or "match_id" not in goalscorers.columns:
+        return
+    goals = goalscorers.loc[goalscorers["match_id"] == match_id].copy()
+    if goals.empty:
+        return
+    goals = goals.sort_values("minute", na_position="last")
+    with st.container(border=True):
+        st.subheader("Strzelcy")
+        for _, goal in goals.iterrows():
+            minute = goal.get("minute")
+            minute_text = f"{int(minute)}'" if pd.notna(minute) else "—"
+            markers = []
+            if bool(goal.get("penalty")):
+                markers.append("k.")
+            if bool(goal.get("own_goal")):
+                markers.append("sam.")
+            marker_text = f" ({', '.join(markers)})" if markers else ""
+            team_label = nominative_pl(str(goal["team_name"]))
+            st.markdown(
+                f"**{minute_text}** {goal['scorer']} — {team_label}{marker_text}"
+            )
+    _ = (home_team, away_team)
 
 
 def _render_recap_tab() -> None:
@@ -1129,25 +1898,13 @@ def _render_recap_tab() -> None:
         )
         return
 
-    tournament = st.selectbox("Rozgrywki", tournaments, key="recap_tournament")
-    matches = _played_matches_in_tournament(str(tournament))
-    if matches.empty:
-        st.info("Brak rozegranych meczów w tych rozgrywkach.")
-        return
-    # Only real, already-played matches are offered, so the old "guess a date
-    # and hope the match exists" failure mode can't happen any more.
-    index = st.selectbox(
-        "Mecz",
-        range(len(matches)),
-        format_func=lambda position: _format_fixture(matches.iloc[position]),
-        key="recap_match",
-    )
-
-    if st.button("Pokaż podsumowanie", type="primary", key="recap_run"):
-        st.session_state["recap_result"] = int(matches.iloc[int(index)]["match_id"])
-
     stored_match_id = st.session_state.get("recap_result")
     if stored_match_id is None:
+        _render_recent_results_list(tournaments)
+        return
+
+    st.button("← Wszystkie mecze", key="recap_back", on_click=_clear_recap)
+    if st.session_state.get("recap_result") is None:
         return
 
     records_frame = _load_records_frame()
@@ -1178,25 +1935,15 @@ def _render_recap_tab() -> None:
             unsafe_allow_html=True,
         )
 
+    _render_match_statistics(result_row, home_label, away_label)
+    _render_goalscorers(int(stored_match_id), home, away)
+
     with st.container(border=True):
         st.subheader("Fakty historyczne")
         st.caption(
             "Stan na moment tuż po tym meczu — z faktami, które stworzył on sam."
         )
         _render_facts(facts)
-
-    export_lines = [
-        f"# {home_label} — {away_label} ({match_date})",
-        "",
-        f"Wynik: {int(result_row['home_score'])}:{int(result_row['away_score'])}",
-        "",
-        "## Fakty historyczne",
-    ]
-    if facts:
-        export_lines.extend(f"- {render_fact(fact)}" for fact in facts)
-    else:
-        export_lines.append("- (brak faktów historycznych dla tej pary)")
-    _render_export(f"{home}-{away}-{match_date}-recap", "\n".join(export_lines))
 
 
 # --------------------------------------------------------------------------
@@ -1206,8 +1953,14 @@ def _render_recap_tab() -> None:
 
 def _render_competition_outlook_tab() -> None:
     """Real remaining Nations League fixtures + predictions, fed to Monte Carlo."""
+    st.markdown(
+        "Rozgrywamy pozostałe mecze grupy dziesiątki tysięcy razy. Za każdym razem "
+        "losujemy wyniki zgodnie z prognozą modelu dla konkretnego spotkania, "
+        "układamy tabelę końcową i zapisujemy, kto gdzie skończył. Procent obok "
+        "drużyny to po prostu udział rozegrań, w których zajęła miejsce dające awans."
+    )
     teams = _predictable_team_names()
-    column_team, column_season = st.columns(2)
+    column_team, column_spots = st.columns(2)
     with column_team:
         team_query = (
             st.selectbox(
@@ -1220,9 +1973,6 @@ def _render_competition_outlook_tab() -> None:
             if teams
             else st.text_input("Drużyna", value="Poland", key="outlook_team_text")
         )
-    with column_season:
-        season = st.text_input("Sezon", value="2026–27", key="outlook_season")
-    column_spots, column_simulations = st.columns(2)
     with column_spots:
         n_qualifying_spots = st.number_input(
             "Liczba awansujących miejsc",
@@ -1231,21 +1981,33 @@ def _render_competition_outlook_tab() -> None:
             value=1,
             key="outlook_spots",
         )
-    with column_simulations:
+    with st.expander("Ustawienia", expanded=False):
+        season = st.text_input("Sezon", value="2026–27", key="outlook_season")
         n_simulations = st.number_input(
-            "Liczba symulacji Monte Carlo",
+            "Liczba rozegrań (symulacji Monte Carlo)",
             min_value=100,
             max_value=50_000,
             value=10_000,
             step=1000,
             key="outlook_simulations",
+            help="Więcej rozegrań = stabilniejsze procenty, ale dłuższe liczenie.",
         )
 
-    if st.button("Symuluj grupę", type="primary", key="outlook_run"):
+    autorun = st.session_state.pop("outlook_autorun", False)
+    if st.button("Symuluj grupę", type="primary", key="outlook_run") or autorun:
         uefa_source = UefaNationsLeagueSource()
         try:
-            with st.spinner("Szukam grupy drużyny..."):
-                division, group = uefa_source.find_team_group(team_query, season=season)
+            # A jump from the pre-match screen already knows the group, so it
+            # skips the four-page Wikipedia search that finding it requires.
+            requested_division = st.session_state.pop("outlook_division", None)
+            requested_group = st.session_state.pop("outlook_group", None)
+            if requested_division and requested_group:
+                division, group = requested_division, requested_group
+            else:
+                with st.spinner("Szukam grupy drużyny..."):
+                    division, group = uefa_source.find_team_group(
+                        team_query, season=season
+                    )
         except ValueError as error:
             st.session_state["outlook_result"] = {"error": str(error)}
         else:
@@ -1329,6 +2091,36 @@ def _render_competition_outlook_tab() -> None:
             f"Pozostałe mecze do rozegrania: {len(simulation_input.remaining_matches)}"
         )
 
+    with st.container(border=True):
+        # Far richer than the single qualification percentage above: it
+        # separates "reliably second" from "either first or last", which the
+        # one-number view collapses into the same figure.
+        st.subheader("Gdzie kończy każda drużyna")
+        positions = simulate_final_positions(
+            simulation_input.teams,
+            simulation_input.played_matches,
+            simulation_input.remaining_matches,
+            n_simulations=int(n_simulations),
+        )
+        ordered_teams = sorted(positions, key=lambda team: -positions[team][0])
+        matrix = [positions[team] for team in ordered_teams]
+        st.plotly_chart(
+            _heatmap_figure(
+                matrix=matrix,
+                x_labels=[
+                    f"{place}. miejsce" for place in range(1, len(ordered_teams) + 1)
+                ],
+                y_labels=[nominative_pl(team) for team in ordered_teams],
+                cell_texts=[[f"{value:.0%}" for value in row] for row in matrix],
+                height=90 + 46 * len(ordered_teams),
+            ),
+            width="stretch",
+        )
+        st.caption(
+            "Każdy wiersz sumuje się do 100% — drużyna kończy "
+            "dokładnie na jednym miejscu."
+        )
+
     _render_what_if(simulation_input, int(n_qualifying_spots), int(n_simulations))
 
 
@@ -1351,8 +2143,7 @@ def _render_what_if(
             """Both sides of one remaining fixture, in Polish."""
             match = remaining[index]
             return (
-                f"{nominative_pl(match.home_team)} — "
-                f"{nominative_pl(match.away_team)}"
+                f"{nominative_pl(match.home_team)} — {nominative_pl(match.away_team)}"
             )
 
         match_index = st.selectbox(
@@ -1418,16 +2209,77 @@ def _render_what_if(
 # --------------------------------------------------------------------------
 
 
+def _render_header() -> None:
+    """Centred product name, one thin line of description, PDF export on the right."""
+    title_column, export_column = st.columns([5, 1])
+    with title_column:
+        st.markdown(
+            f"<div style='text-align:center'>"
+            f"<div style='font-size:2.6rem;font-weight:700;letter-spacing:0.06em'>"
+            f"{_APP_NAME}</div>"
+            f"<div style='font-size:0.85rem;"
+            f"color:{_MUTED_TEXT_COLOUR};margin-top:0.2rem'>"
+            f"{_APP_TAGLINE}</div></div>",
+            unsafe_allow_html=True,
+        )
+    with export_column:
+        _render_pdf_export()
+    st.markdown("")
+
+
+def _render_pdf_export() -> None:
+    """Offer the analysis currently on screen as a one-page PDF.
+
+    Rebuilt from `selected_fixture` rather than from a payload stashed by the
+    analysis screen: the header renders *before* the tabs do, so a stashed
+    payload is always one interaction stale and the button never shows up on
+    the run that first opens an analysis. Everything needed here is already
+    memoised, so recomputing costs nothing.
+    """
+    stored = st.session_state.get("selected_fixture")
+    if stored is None:
+        return
+    home, away, match_date, tournament = stored
+    try:
+        prediction = _cached_prediction(home, away, match_date, tournament)
+        as_of = pd.Timestamp(match_date, tz="UTC")
+        facts = [
+            fact
+            for fact in _cached_facts(home, away, as_of.isoformat(), 10)
+            if fact.fact_type not in _STRUCTURAL_FACT_TYPES
+        ]
+        home_label = nominative_pl(home)
+        away_label = nominative_pl(away)
+        _, top_scorelines, _ = _score_grid_figure(
+            home_label, away_label, prediction.goals["home"], prediction.goals["away"]
+        )
+        pdf_bytes = _build_analysis_pdf(
+            home_label=home_label,
+            away_label=away_label,
+            match_date=match_date,
+            tournament=tournament,
+            prediction=prediction,
+            facts=facts,
+            head_to_head_summary=_head_to_head_summary(home, away, as_of),
+            top_scorelines=top_scorelines,
+        )
+    except Exception:
+        st.caption("PDF niedostępny")
+        return
+    st.download_button(
+        "Eksportuj do PDF",
+        data=pdf_bytes,
+        file_name=f"{home}-{away}-{match_date}.pdf".replace(" ", "_"),
+        mime="application/pdf",
+        width="stretch",
+    )
+
+
 def main() -> None:
     """Render the demo app."""
-    st.title("Football AI")
-    st.caption(
-        "Predykcje meczów reprezentacji narodowych z modeli uczonych na "
-        "realnych danych historycznych — każdy fakt z możliwością "
-        "sprawdzenia meczów źródłowych."
-    )
+    _render_header()
     preview_tab, recap_tab, outlook_tab = st.tabs(
-        ["Przed meczem", "Po meczu", "Perspektywy grupy"]
+        ["Nadchodzące mecze", "Po meczu", "Perspektywy grupy"]
     )
     with preview_tab:
         _render_match_preview_tab()
