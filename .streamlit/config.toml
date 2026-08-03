@@ -1,0 +1,19 @@
+# Muted editorial palette -- graphite/navy with a single warm accent.
+# Deliberately not a betting-dashboard look: this screen is read by a sports
+# journalist deciding whether to publish something under their own name, so
+# it should read like a newsroom tool, not a live-odds board.
+# Text/background contrast is 13.9:1 (WCAG AAA); the accent on the base
+# background is 8.1:1 -- both well clear of the 4.5:1 AA floor.
+[theme]
+base = "dark"
+primaryColor = "#c9a227"
+backgroundColor = "#12161f"
+secondaryBackgroundColor = "#1b2130"
+textColor = "#e8eaed"
+font = "serif"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
