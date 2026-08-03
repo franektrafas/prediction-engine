@@ -198,7 +198,28 @@ class HeadToHeadTemplateTestCase(unittest.TestCase):
         )
         self.assertEqual(
             templates_pl.h2h_first_win_since(fact),
-            "Polska pokonała Brazil w 1974 roku, pierwszy raz w historii.",
+            "Polska pokonała Brazylię w 1974 roku, pierwszy raz w historii.",
+        )
+
+    def test_h2h_first_win_since_declines_a_team_with_no_polish_form(self) -> None:
+        """A team outside `team_names_pl`'s table keeps its raw English name, not a crash.
+
+        Pins the documented fallback that the assertion above used to cover
+        by accident: it asserted "pokonała Brazil" purely because Brazil had
+        no Polish form yet, so adding the World Cup sides to that table
+        (2026-08-03) silently turned it into a test of the fallback path for
+        a team that no longer uses it. This uses a team that genuinely isn't
+        in the table, so the fallback stays covered on purpose.
+        """
+        fact = _fact(
+            "h2h_first_win_since",
+            "Poland",
+            {"opponent": "Yoruba Nation", "win_year": 1974, "gap_years": None},
+            related_teams=("Yoruba Nation",),
+        )
+        self.assertEqual(
+            templates_pl.h2h_first_win_since(fact),
+            "Polska pokonała Yoruba Nation w 1974 roku, pierwszy raz w historii.",
         )
 
 

@@ -15,10 +15,13 @@ three cases plus verb-agreement class, not full 7-case Polish declension:
   Germany/Italy/Hungary/Czechia/Faroe Islands are all grammatically plural
   nouns in Polish, not "many countries", one country with a plural name).
 
-Same 55-team UEFA member list as `config.fifa_country_codes`, for the same
-reason: this project's canonical English team name
-(`data.normalization.canonicalize_team_name`'s output) is the only key any
-caller has, so this dict is keyed by that, not by FIFA code.
+Covers the 55 UEFA members (same list as `config.fifa_country_codes`) plus
+every non-UEFA side that appears in a real FIFA World Cup in this project's
+own data -- keyed by this project's canonical English team name
+(`data.normalization.canonicalize_team_name`'s output), the only key any
+caller has, not by FIFA code. Teams outside both groups still fall back to
+the raw English name (see `team_form`), which is slightly-off Polish rather
+than a failure.
 
 Standard, well-established Polish country-name forms -- not independently
 verified against an official style guide team by team (the same standing
@@ -88,6 +91,72 @@ _TEAM_FORMS_PL: dict[str, tuple[str, str, str, str]] = {
     "Turkey": ("Turcja", "Turcji", "Turcję", "f"),
     "Ukraine": ("Ukraina", "Ukrainie", "Ukrainę", "f"),
     "Wales": ("Walia", "Walii", "Walię", "f"),
+    # --- Non-UEFA World Cup participants -------------------------------
+    # Added 2026-08-03: the UEFA-only table above left every non-European
+    # side falling back to its raw English name *and* to neuter agreement,
+    # which produced real, visible errors on the highest-profile screens
+    # this project has -- the 2026 World Cup final rendered as "Argentina
+    # zanotowało" instead of "Argentyna zanotowała". Scope is exactly the
+    # sides that appear in a real FIFA World Cup in the project's own data
+    # (2018/2022/2026); the remaining ~190 national teams still degrade to
+    # the raw-name fallback documented above.
+    "Algeria": ("Algieria", "Algierii", "Algierię", "f"),
+    "Argentina": ("Argentyna", "Argentynie", "Argentynę", "f"),
+    "Australia": ("Australia", "Australii", "Australię", "f"),
+    "Brazil": ("Brazylia", "Brazylii", "Brazylię", "f"),
+    "Cabo Verde": (
+        "Zielony Przylądek",
+        "Zielonemu Przylądkowi",
+        "Zielony Przylądek",
+        "m",
+    ),
+    "Cameroon": ("Kamerun", "Kamerunowi", "Kamerun", "m"),
+    "Canada": ("Kanada", "Kanadzie", "Kanadę", "f"),
+    "Colombia": ("Kolumbia", "Kolumbii", "Kolumbię", "f"),
+    # "DR Konga" rather than the full "Demokratyczna Republika Konga":
+    # standard in Polish football coverage, and short enough for a chart
+    # label. Feminine agreement follows the implied "Republika".
+    "Congo DR": ("DR Konga", "DR Konga", "DR Konga", "f"),
+    "Costa Rica": ("Kostaryka", "Kostaryce", "Kostarykę", "f"),
+    "Curacao": ("Curaçao", "Curaçao", "Curaçao", "n"),
+    "Ecuador": ("Ekwador", "Ekwadorowi", "Ekwador", "m"),
+    "Egypt": ("Egipt", "Egiptowi", "Egipt", "m"),
+    "Ghana": ("Ghana", "Ghanie", "Ghanę", "f"),
+    "Haiti": ("Haiti", "Haiti", "Haiti", "n"),
+    "Iran": ("Iran", "Iranowi", "Iran", "m"),
+    "Iraq": ("Irak", "Irakowi", "Irak", "m"),
+    "Ivory Coast": (
+        "Wybrzeże Kości Słoniowej",
+        "Wybrzeżu Kości Słoniowej",
+        "Wybrzeże Kości Słoniowej",
+        "n",
+    ),
+    "Japan": ("Japonia", "Japonii", "Japonię", "f"),
+    "Jordan": ("Jordania", "Jordanii", "Jordanię", "f"),
+    "Mexico": ("Meksyk", "Meksykowi", "Meksyk", "m"),
+    "Morocco": ("Maroko", "Maroku", "Maroko", "n"),
+    "New Zealand": ("Nowa Zelandia", "Nowej Zelandii", "Nową Zelandię", "f"),
+    "Nigeria": ("Nigeria", "Nigerii", "Nigerię", "f"),
+    "Panama": ("Panama", "Panamie", "Panamę", "f"),
+    "Paraguay": ("Paragwaj", "Paragwajowi", "Paragwaj", "m"),
+    "Peru": ("Peru", "Peru", "Peru", "n"),
+    "Qatar": ("Katar", "Katarowi", "Katar", "m"),
+    "Saudi Arabia": ("Arabia Saudyjska", "Arabii Saudyjskiej", "Arabię Saudyjską", "f"),
+    "Senegal": ("Senegal", "Senegalowi", "Senegal", "m"),
+    # "RPA" rather than "Republika Południowej Afryki" for the same
+    # length reason as "DR Konga"; feminine agreement, again from
+    # the implied "Republika".
+    "South Africa": ("RPA", "RPA", "RPA", "f"),
+    "South Korea": ("Korea Południowa", "Korei Południowej", "Koreę Południową", "f"),
+    "Tunisia": ("Tunezja", "Tunezji", "Tunezję", "f"),
+    "United States": (
+        "Stany Zjednoczone",
+        "Stanom Zjednoczonym",
+        "Stany Zjednoczone",
+        "pl",
+    ),
+    "Uruguay": ("Urugwaj", "Urugwajowi", "Urugwaj", "m"),
+    "Uzbekistan": ("Uzbekistan", "Uzbekistanowi", "Uzbekistan", "m"),
 }
 
 

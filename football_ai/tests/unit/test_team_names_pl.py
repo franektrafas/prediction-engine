@@ -34,11 +34,35 @@ class TeamNamesPlTestCase(unittest.TestCase):
         self.assertEqual(dative_pl("San Marino"), "San Marino")
         self.assertEqual(accusative_pl("San Marino"), "San Marino")
 
+    def test_world_cup_participants_outside_uefa_are_translated(self) -> None:
+        """Non-UEFA World Cup sides got real Polish forms on 2026-08-03.
+
+        Before that the table was UEFA-only, so the 2026 World Cup final
+        rendered as "Argentina zanotowało" -- raw English name plus neuter
+        agreement -- on the app's most prominent screen.
+        """
+        self.assertEqual(nominative_pl("Argentina"), "Argentyna")
+        self.assertEqual(accusative_pl("Argentina"), "Argentynę")
+        self.assertEqual(gender_pl("Argentina"), "f")
+        # Pluralia tantum, like Germany: "Stany Zjednoczone wygrały".
+        self.assertEqual(nominative_pl("United States"), "Stany Zjednoczone")
+        self.assertEqual(dative_pl("United States"), "Stanom Zjednoczonym")
+        self.assertEqual(gender_pl("United States"), "pl")
+        # Neuter, and indeclinable in the accusative: "Maroko wygrało".
+        self.assertEqual(nominative_pl("Morocco"), "Maroko")
+        self.assertEqual(dative_pl("Morocco"), "Maroku")
+        self.assertEqual(gender_pl("Morocco"), "n")
+
     def test_untranslated_team_falls_back_to_the_raw_english_name(self) -> None:
-        """A non-UEFA opponent (this table's real, documented scope gap) must degrade, not crash."""
-        self.assertEqual(nominative_pl("Brazil"), "Brazil")
-        self.assertEqual(dative_pl("Brazil"), "Brazil")
-        self.assertEqual(gender_pl("Brazil"), "n")
+        """A team outside the table (~190 of them remain) must degrade, not crash.
+
+        Uses a genuinely absent side rather than a major nation: this
+        assertion used to be written against "Brazil", which quietly stopped
+        testing the fallback the moment the World Cup sides were added.
+        """
+        self.assertEqual(nominative_pl("Yoruba Nation"), "Yoruba Nation")
+        self.assertEqual(dative_pl("Yoruba Nation"), "Yoruba Nation")
+        self.assertEqual(gender_pl("Yoruba Nation"), "n")
 
 
 if __name__ == "__main__":
