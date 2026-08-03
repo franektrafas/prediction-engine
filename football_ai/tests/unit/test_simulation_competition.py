@@ -5,7 +5,12 @@ from __future__ import annotations
 import time
 import unittest
 
-from football_ai.simulation.competition import PlayedMatch, compute_standings, simulate_group_qualification
+from football_ai.simulation.competition import (
+    PlayedMatch,
+    compute_standings,
+    simulate_final_positions,
+    simulate_group_qualification,
+)
 from football_ai.simulation.monte_carlo import MatchExpectation
 
 
@@ -94,6 +99,62 @@ class SimulateGroupQualificationTestCase(unittest.TestCase):
             n_simulations=2_000, seed=5,
         )
         self.assertEqual(probabilities["Doomed"], 0.0)
+
+
+class SimulateFinalPositionsTestCase(unittest.TestCase):
+    """The full finishing distribution, not just "did they qualify"."""
+
+    def setUp(self) -> None:
+        """Build a small group with one played match and three still to come."""
+        self.teams = ["Poland", "Germany", "Netherlands", "Wales"]
+        self.played = [PlayedMatch("Poland", "Wales", 2, 0)]
+        self.remaining = [
+            MatchExpectation("Germany", "Netherlands", 1.4, 1.3),
+            MatchExpectation("Poland", "Germany", 1.2, 1.6),
+            MatchExpectation("Netherlands", "Wales", 1.8, 0.9),
+        ]
+
+    def test_every_team_row_sums_to_one(self) -> None:
+        """Each simulation places a team in exactly one place, so its row is a distribution."""
+        positions = simulate_final_positions(
+            self.teams,
+            self.played,
+            self.remaining,
+            n_simulations=2_000,
+            seed=7,
+        )
+        self.assertEqual(sorted(positions), sorted(self.teams))
+        for team, distribution in positions.items():
+            self.assertEqual(len(distribution), len(self.teams))
+            self.assertAlmostEqual(
+                sum(distribution), 1.0, places=9, msg=f"{team} row must sum to 1.0"
+            )
+
+    def test_each_position_is_filled_exactly_once_per_simulation(self) -> None:
+        """A *column* across teams must also sum to 1.0 -- one team per place."""
+        positions = simulate_final_positions(
+            self.teams,
+            self.played,
+            self.remaining,
+            n_simulations=2_000,
+            seed=11,
+        )
+        for place in range(len(self.teams)):
+            column_total = sum(
+                distribution[place] for distribution in positions.values()
+            )
+            self.assertAlmostEqual(
+                column_total, 1.0, places=9, msg=f"place {place + 1}"
+            )
+
+    def test_a_dominant_team_wins_the_group_most_often(self) -> None:
+        """Positions must track strength, not merely be well-formed numbers."""
+        teams = ["Strong", "Weak"]
+        remaining = [MatchExpectation("Strong", "Weak", 4.0, 0.2)]
+        positions = simulate_final_positions(
+            teams, [], remaining, n_simulations=2_000, seed=3
+        )
+        self.assertGreater(positions["Strong"][0], positions["Weak"][0])
 
 
 if __name__ == "__main__":

@@ -137,3 +137,45 @@ def simulate_group_qualification(
         for standing in standings[:n_qualifying_spots]:
             qualification_counts[standing.team] += 1
     return {team: count / simulation.n_simulations for team, count in qualification_counts.items()}
+
+
+def simulate_final_positions(
+    teams: list[str],
+    played_matches: list[PlayedMatch],
+    remaining_matches: list[MatchExpectation],
+    n_simulations: int = 10_000,
+    seed: int | None = None,
+) -> dict[str, list[float]]:
+    """How often each team finishes in each final position, 1st through last.
+
+    Same machinery as `simulate_group_qualification` -- real played results
+    plus Monte Carlo remaining results, ranked by `compute_standings` -- but
+    it keeps the whole finishing distribution instead of collapsing it to
+    "top N or not". A single qualification percentage can't distinguish a
+    team that is reliably second from one that finishes either first or
+    last, which is exactly the difference a group preview needs to show.
+
+    Returns `{team: [P(1st), P(2nd), ...]}` with one entry per team in the
+    group; each team's own list sums to 1.0 (every simulation places every
+    team exactly once). Deliberately additive: `simulate_group_qualification`
+    is untouched, so nothing already depending on it changes behaviour.
+    """
+    simulation = run_simulations(remaining_matches, n_simulations, seed)
+    position_counts = {team: [0] * len(teams) for team in teams}
+    for simulation_index in range(simulation.n_simulations):
+        remaining_results = [
+            (
+                match.home_team,
+                match.away_team,
+                int(simulation.home_goals[simulation_index, match_index]),
+                int(simulation.away_goals[simulation_index, match_index]),
+            )
+            for match_index, match in enumerate(simulation.matches)
+        ]
+        standings = compute_standings(teams, played_matches, remaining_results)
+        for position, standing in enumerate(standings):
+            position_counts[standing.team][position] += 1
+    return {
+        team: [count / simulation.n_simulations for count in counts]
+        for team, counts in position_counts.items()
+    }
