@@ -25,6 +25,7 @@ import streamlit as st
 from football_ai.config.settings import get_settings
 from football_ai.data.io import read_table
 from football_ai.data.normalization import canonicalize_team_name
+from football_ai.insights import h2h, streaks
 from football_ai.insights.detectors import facts_for_match
 from football_ai.insights.schemas import Fact
 from football_ai.narrative.renderer import render_fact
@@ -116,6 +117,54 @@ _DIAGNOSTIC_TARGETS: tuple[tuple[str, str], ...] = (
     ("home_possession", "Posiadanie gospodarza"),
     ("away_possession", "Posiadanie gościa"),
 )
+
+# Facts already presented as structured context (head-to-head + current
+# streaks) are filtered out of the ranked "unusual facts" list, so the same
+# information can't appear twice on one screen.
+_STRUCTURAL_FACT_TYPES: frozenset[str] = frozenset(
+    {
+        "h2h_first_win_since",
+        "h2h_never_won",
+        "win_streak",
+        "unbeaten_streak",
+        "scoreless_streak",
+        "clean_sheet_streak",
+    }
+)
+
+_WEEKDAYS_PL: tuple[str, ...] = (
+    "Poniedziałek",
+    "Wtorek",
+    "Środa",
+    "Czwartek",
+    "Piątek",
+    "Sobota",
+    "Niedziela",
+)
+_MONTHS_GENITIVE_PL: tuple[str, ...] = (
+    "stycznia",
+    "lutego",
+    "marca",
+    "kwietnia",
+    "maja",
+    "czerwca",
+    "lipca",
+    "sierpnia",
+    "września",
+    "października",
+    "listopada",
+    "grudnia",
+)
+
+# (background, text) per result marker. The letter carries the meaning and
+# colour only reinforces it, so the row still reads in greyscale or with
+# colour-vision deficiency. Text is a dark shade of the marker's own hue
+# rather than black; every pair clears 6.8:1, well past the 4.5:1 AA floor.
+_RESULT_MARKER_STYLES: dict[str, tuple[str, str]] = {
+    "W": ("#a8c4b0", "#1d3326"),
+    "R": ("#c2c6cc", "#262a30"),
+    "P": ("#d4a99a", "#3d2019"),
+}
 
 _MATCH_CONTEXT_LABELS_PL: dict[str, tuple[str, str]] = {
     "home_injured_market_value": ("Wartość kontuzjowanych (gospodarz)", "money"),
@@ -304,6 +353,34 @@ def _cached_prediction(
 
 
 @st.cache_data(show_spinner=False)
+def _cached_head_to_head(home: str, away: str, as_of_iso: str) -> pd.DataFrame:
+    """Full head-to-head history from the home team's perspective.
+
+    `insights.h2h.h2h_matches` already derives `team_a_result` per meeting,
+    so nothing here recomputes a result -- the app only counts and formats.
+    """
+    return h2h.h2h_matches(_load_records_frame(), home, away, pd.Timestamp(as_of_iso))
+
+
+@st.cache_data(show_spinner=False)
+def _cached_recent_form(team: str, as_of_iso: str, limit: int = 10) -> pd.DataFrame:
+    """A team's most recent matches, oldest first, goals_for/against attached."""
+    matches = streaks.team_matches(
+        _load_records_frame(), team, pd.Timestamp(as_of_iso)
+    )
+    return matches.tail(limit)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_current_streaks(team: str, as_of_iso: str) -> list[str]:
+    """Every live streak for a team, already rendered to Polish sentences."""
+    facts = streaks.all_current_streaks(
+        _load_records_frame(), team, pd.Timestamp(as_of_iso)
+    )
+    return [render_fact(fact) for fact in facts]
+
+
+@st.cache_data(show_spinner=False)
 def _cached_facts(home: str, away: str, as_of_iso: str, top_n: int) -> list[Fact]:
     """Facts for a match, keyed on values -- the frames are cached separately."""
     return facts_for_match(
@@ -447,6 +524,165 @@ def _format_provenance_row(record: dict[str, object]) -> str:
     return f"{match_date} · {home} {score} {away}{suffix}"
 
 
+def _format_date_header_pl(day: date) -> str:
+    """"Czwartek, 24 września" -- Polish weekday + genitive month, built by hand.
+
+    Not `locale`/`babel`: neither is a dependency here and `setlocale` is
+    process-global, so a Streamlit worker changing it would leak into every
+    other thread's formatting.
+    """
+    month = _MONTHS_GENITIVE_PL[day.month - 1]
+    return f"{_WEEKDAYS_PL[day.weekday()]}, {day.day} {month}"
+
+
+def _plural_pl(count: int, one: str, few: str, many: str) -> str:
+    """Polish numeral agreement: 1 mecz, 2 mecze, 5 meczów.
+
+    Polish takes three forms, not two, and the "few" form is skipped for the
+    teens -- 22 mecze but 12 meczów. Written out here because the app builds
+    counted phrases ("3 spotkania", "2 zwycięstwa") that read as broken
+    Polish with naive English-style pluralisation.
+    """
+    if count == 1:
+        return one
+    if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
+        return few
+    return many
+
+
+def _result_letter(goals_for: float, goals_against: float) -> str:
+    """W/R/P from one team's own goal columns -- same letters the group table uses."""
+    if goals_for > goals_against:
+        return "W"
+    if goals_for == goals_against:
+        return "R"
+    return "P"
+
+
+def _form_markers_html(letters: list[str]) -> str:
+    """A row of W/R/P squares, oldest on the left."""
+    markers = []
+    for letter in letters:
+        background, foreground = _RESULT_MARKER_STYLES[letter]
+        markers.append(
+            f"<span style='display:inline-flex;align-items:center;"
+            f"justify-content:center;width:22px;height:22px;margin-right:4px;"
+            f"border-radius:4px;background:{background};color:{foreground};"
+            f"font-weight:700;font-size:12px;font-family:sans-serif'>{letter}</span>"
+        )
+    return f"<div style='display:flex;flex-wrap:wrap'>{''.join(markers)}</div>"
+
+
+def _render_head_to_head(home: str, away: str, as_of: pd.Timestamp) -> None:
+    """W/D/L balance from the home team's side, plus the last five meetings."""
+    meetings = _cached_head_to_head(home, away, as_of.isoformat())
+    home_label = nominative_pl(home)
+    away_label = nominative_pl(away)
+    st.markdown("**Bilans bezpośredni**")
+    if meetings.empty:
+        st.caption(
+            f"{home_label} i {away_label} nigdy dotąd ze sobą nie grały — to byłoby "
+            "ich pierwsze spotkanie."
+        )
+        return
+
+    counts = meetings["team_a_result"].value_counts()
+    wins = int(counts.get("win", 0))
+    draws = int(counts.get("draw", 0))
+    losses = int(counts.get("loss", 0))
+    st.caption(
+        f"{len(meetings)} "
+        f"{_plural_pl(len(meetings), 'spotkanie', 'spotkania', 'spotkań')} · "
+        f"z perspektywy {home_label}: "
+        f"{wins} {_plural_pl(wins, 'zwycięstwo', 'zwycięstwa', 'zwycięstw')}, "
+        f"{draws} {_plural_pl(draws, 'remis', 'remisy', 'remisów')}, "
+        f"{losses} {_plural_pl(losses, 'porażka', 'porażki', 'porażek')}."
+    )
+    recent = meetings.tail(5).iloc[::-1]
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "Data": pd.Timestamp(row["match_date"]).date(),
+                    "Wynik": (
+                        f"{nominative_pl(str(row['home_team_name']))} "
+                        f"{int(row['home_score'])}:{int(row['away_score'])} "
+                        f"{nominative_pl(str(row['away_team_name']))}"
+                    ),
+                    "Rozgrywki": str(row.get("tournament") or ""),
+                }
+                for _, row in recent.iterrows()
+            ]
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+
+
+def _render_team_form(team: str, as_of: pd.Timestamp) -> None:
+    """Last ten results as W/R/P markers, with the full table one expander away."""
+    label = nominative_pl(team)
+    form = _cached_recent_form(team, as_of.isoformat())
+    st.markdown(f"**{label}**")
+    if form.empty:
+        st.caption("Brak meczów w zbiorze historycznym przed tą datą.")
+        return
+
+    letters = [
+        _result_letter(row["goals_for"], row["goals_against"])
+        for _, row in form.iterrows()
+    ]
+    st.markdown(_form_markers_html(letters), unsafe_allow_html=True)
+    # A team with fewer than ten matches shows however many it really has --
+    # never padded to look like a full row.
+    if len(letters) < 10:
+        matches_word = _plural_pl(len(letters), "mecz", "mecze", "meczów")
+        st.caption(f"Tylko {len(letters)} {matches_word} w historii przed tą datą.")
+
+    streak_sentences = _cached_current_streaks(team, as_of.isoformat())
+    st.caption(
+        " ".join(streak_sentences) if streak_sentences else "Brak aktualnej serii."
+    )
+
+    with st.expander(f"Pełna forma: {label}", expanded=False):
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Data": pd.Timestamp(row["match_date"]).date(),
+                        "Przeciwnik": nominative_pl(str(row["opponent"])),
+                        "Wynik": f"{int(row['goals_for'])}:{int(row['goals_against'])}",
+                        "Gdzie": "dom" if bool(row["is_home"]) else "wyjazd",
+                    }
+                    for _, row in form.iloc[::-1].iterrows()
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
+
+def _render_structural_context(home: str, away: str, as_of: pd.Timestamp) -> None:
+    """Head-to-head and form -- always shown, never ranked against each other.
+
+    Deliberately separate from the ranked `facts_for_match` list: `weight`
+    compares incomparable scales (a fixed 0.3 for a match-count milestone vs.
+    a computed 0.1 + 0.03/meeting for head-to-head), so a jubilee for one
+    team could push the other team's unbeaten run out of the top ten and the
+    whole list read as arbitrary. This block is the match context; the ranked
+    list below the prediction is explicitly labelled as trivia.
+    """
+    with st.container(border=True):
+        st.subheader("Bilans i forma")
+        _render_head_to_head(home, away, as_of)
+        st.divider()
+        home_column, away_column = st.columns(2)
+        with home_column:
+            _render_team_form(home, as_of)
+        with away_column:
+            _render_team_form(away, as_of)
+
+
 def _render_facts(facts: list[Fact]) -> None:
     """Ranked facts, each expandable to the real matches it was derived from."""
     if not facts:
@@ -470,7 +706,9 @@ def _render_facts(facts: list[Fact]) -> None:
             f"waga {fact.weight:.2f}</span>",
             unsafe_allow_html=True,
         )
-        with st.expander(f"Źródło: {len(fact.provenance)} mecz(e/ów)", expanded=False):
+        source_count = len(fact.provenance)
+        source_word = _plural_pl(source_count, "mecz", "mecze", "meczów")
+        with st.expander(f"Źródło: {source_count} {source_word}", expanded=False):
             missing = [
                 match_id for match_id in fact.provenance if match_id not in lookup
             ]
@@ -481,8 +719,10 @@ def _render_facts(facts: list[Fact]) -> None:
             if missing:
                 missing_ids = ", ".join(str(match_id) for match_id in missing[:10])
                 st.caption(
-                    f"{len(missing)} mecz(y) spoza załadowanego zbioru "
-                    f"historycznego (match_id: {missing_ids})."
+                    f"{len(missing)} "
+                    f"{_plural_pl(len(missing), 'mecz', 'mecze', 'meczów')} "
+                    f"spoza załadowanego zbioru historycznego "
+                    f"(match_id: {missing_ids})."
                 )
         if index < len(facts) - 1:
             st.markdown("")
@@ -631,103 +871,144 @@ def _team_picker(
 # --------------------------------------------------------------------------
 
 
-def _pick_upcoming_fixture() -> tuple[str, str, date, str] | None:
-    """Choose a real, scheduled Nations League fixture instead of typing a pairing."""
-    column_division, column_group, column_season = st.columns(3)
-    with column_division:
-        division = st.selectbox(
-            "Dywizja", ["A", "B", "C", "D"], index=1, key="preview_division"
+def _select_fixture(home: str, away: str, match_date: date, tournament: str) -> None:
+    """Move to the analysis screen for one fixture."""
+    st.session_state["selected_fixture"] = (home, away, match_date, tournament)
+    st.rerun()
+
+
+def _render_fixture_card(
+    row: pd.Series, elo_ratings: dict[str, float], key: str
+) -> None:
+    """One fixture as a full-width, visibly clickable card."""
+    home = str(row["home_team_name"])
+    away = str(row["away_team_name"])
+    with st.container(border=True):
+        venue_column, teams_column, action_column = st.columns([2, 3, 2])
+        with venue_column:
+            # The Wikipedia fixture tables carry a date but no kick-off time
+            # (verified: every timestamp is exactly 00:00), so this shows the
+            # real venue rather than inventing an hour.
+            st.caption(str(row.get("stadium") or "—"))
+        with teams_column:
+            st.markdown(f"**{nominative_pl(home)}**  \n**{nominative_pl(away)}**")
+        with action_column:
+            home_elo = elo_ratings.get(canonicalize_team_name(home))
+            away_elo = elo_ratings.get(canonicalize_team_name(away))
+            st.caption(
+                f"Elo {home_elo:.0f} — {away_elo:.0f}"
+                if home_elo and away_elo
+                else "Elo: brak"
+            )
+            if st.button("Analiza", key=key, width="stretch"):
+                _select_fixture(
+                    home,
+                    away,
+                    pd.Timestamp(row["match_date"]).date(),
+                    "UEFA Nations League",
+                )
+
+
+def _render_manual_pair_expander() -> None:
+    """The escape hatch for a pairing that isn't on any schedule."""
+    with st.expander("Dowolna para (mecz spoza terminarza)", expanded=False):
+        st.caption(
+            "Lista obejmuje reprezentacje z aktualnym rankingiem Elo. Drużyny bez "
+            "rankingu (nieistniejące państwa, terytoria zależne, zespoły spoza FIFA) "
+            "są pominięte — silnik nie ma dla nich danych, na których mógłby oprzeć "
+            "sensowną prognozę."
         )
-    with column_group:
-        group = st.selectbox("Grupa", [1, 2, 3, 4], index=3, key="preview_group")
-    with column_season:
-        season = st.text_input("Sezon", value="2026–27", key="preview_season")
+        picked = _team_picker("preview", "Poland", "Sweden")
+        if picked is None:
+            return
+        home, away = picked
+        column_date, column_tournament = st.columns(2)
+        with column_date:
+            match_date = st.date_input(
+                "Data meczu", value=date.today(), key="preview_date"
+            )
+        with column_tournament:
+            tournament = st.text_input(
+                "Turniej", value="UEFA Nations League", key="preview_tournament"
+            )
+        if st.button("Przygotuj analizę", type="primary", key="preview_manual_run"):
+            _select_fixture(home, away, match_date, tournament)
+
+
+def _render_fixture_list() -> None:
+    """Screen 1: every scheduled match of one group, grouped by date."""
+    # Streamlit drops a widget's session_state entry on any run where that
+    # widget isn't rendered -- and the analysis screen renders none of these.
+    # Without mirroring the choice into plain (non-widget) keys, coming back
+    # from an analysis always snapped the list to the defaults instead of the
+    # group the user was actually looking at.
+    division = st.segmented_control(
+        "Dywizja",
+        ["A", "B", "C", "D"],
+        default=st.session_state.get("division_choice", "B"),
+        key="preview_division",
+    )
+    group = st.segmented_control(
+        "Grupa",
+        [1, 2, 3, 4],
+        default=st.session_state.get("group_choice", 4),
+        key="preview_group",
+    )
+    with st.expander("Ustawienia", expanded=False):
+        season = st.text_input(
+            "Sezon",
+            value=st.session_state.get("season_choice", "2026–27"),
+            key="preview_season",
+        )
+    if division is None or group is None:
+        st.caption("Wybierz dywizję i grupę.")
+        return
+    st.session_state["division_choice"] = division
+    st.session_state["group_choice"] = group
+    st.session_state["season_choice"] = season
 
     with st.spinner("Pobieram terminarz..."):
-        fixtures = _nations_league_fixtures(division, int(group), season)
+        fixtures = _nations_league_fixtures(str(division), int(group), season)
     if fixtures.empty:
         st.warning(
             f"Nie udało się pobrać terminarza dla dywizji {division}, grupy {group} "
-            f"({season}). Sprawdź sezon albo wybierz „Dowolna para”."
+            f"({season}). Sprawdź sezon albo użyj „Dowolna para”."
         )
-        return None
+        _render_manual_pair_expander()
+        return
 
-    upcoming = fixtures.loc[fixtures["home_score"].isna()].reset_index(drop=True)
+    upcoming = fixtures.loc[fixtures["home_score"].isna()]
     if upcoming.empty:
         st.info(
             "W tej grupie wszystkie mecze zostały już rozegrane "
             "— zobacz zakładkę „Po meczu”."
         )
-        return None
+        _render_manual_pair_expander()
+        return
 
-    index = st.selectbox(
-        "Mecz",
-        range(len(upcoming)),
-        format_func=lambda position: _format_fixture(upcoming.iloc[position]),
-        key="preview_fixture",
-    )
-    row = upcoming.iloc[int(index)]
-    return (
-        str(row["home_team_name"]),
-        str(row["away_team_name"]),
-        pd.Timestamp(row["match_date"]).date(),
-        "UEFA Nations League",
-    )
+    elo_ratings = _load_elo_ratings()
+    fixtures_by_day = upcoming.groupby(upcoming["match_date"].dt.date, sort=True)
+    for day, day_fixtures in fixtures_by_day:
+        st.markdown(f"##### {_format_date_header_pl(day)}")
+        for position, (_, row) in enumerate(day_fixtures.iterrows()):
+            _render_fixture_card(row, elo_ratings, key=f"fixture_{day}_{position}")
 
-
-def _pick_manual_match() -> tuple[str, str, date, str] | None:
-    """Any pairing at all -- the engine can predict a fixture that isn't scheduled."""
-    st.caption(
-        "Lista obejmuje reprezentacje z aktualnym rankingiem Elo. Drużyny bez "
-        "rankingu (nieistniejące państwa, terytoria zależne, zespoły spoza FIFA) "
-        "są pominięte — silnik nie ma dla nich danych, na których mógłby oprzeć "
-        "sensowną prognozę."
-    )
-    picked = _team_picker("preview", "Poland", "Sweden")
-    if picked is None:
-        return None
-    home, away = picked
-    column_date, column_tournament = st.columns(2)
-    with column_date:
-        match_date = st.date_input("Data meczu", value=date.today(), key="preview_date")
-    with column_tournament:
-        tournament = st.text_input(
-            "Turniej", value="UEFA Nations League", key="preview_tournament"
-        )
-    return home, away, match_date, tournament
+    _render_manual_pair_expander()
 
 
 def _render_match_preview_tab() -> None:
-    """Pick a real scheduled fixture (or any pairing): prediction plus facts."""
-    source = st.radio(
-        "Skąd wziąć mecz",
-        ["Terminarz Ligi Narodów", "Dowolna para"],
-        horizontal=True,
-        key="preview_source",
-        help=(
-            "Terminarz pobiera realne, jeszcze nierozegrane mecze; "
-            "„Dowolna para” pozwala policzyć dowolne zestawienie."
-        ),
-    )
-    selection = (
-        _pick_upcoming_fixture()
-        if source == "Terminarz Ligi Narodów"
-        else _pick_manual_match()
-    )
-    if selection is None:
-        return
-    home, away, match_date, tournament = selection
-
-    if st.button("Przygotuj analizę", type="primary", key="preview_run"):
-        # Results live in session_state, not in the button's own branch --
-        # in Streamlit every widget interaction re-runs the whole script, so
-        # rendering inside `if st.button(...)` makes results vanish the
-        # moment the user touches any other control afterwards.
-        st.session_state["preview_result"] = (home, away, match_date, tournament)
-
-    stored = st.session_state.get("preview_result")
+    """Master-detail: a group's fixture list, or one fixture's full analysis."""
+    stored = st.session_state.get("selected_fixture")
     if stored is None:
+        _render_fixture_list()
         return
+
+    if st.button("← Wszystkie mecze grupy", key="preview_back"):
+        # Only the selection is cleared -- division/group/season live under
+        # their own widget keys, so the list comes back exactly as it was.
+        del st.session_state["selected_fixture"]
+        st.rerun()
+
     home, away, match_date, tournament = stored
 
     with st.spinner("Liczę predykcję..."):
@@ -741,6 +1022,8 @@ def _render_match_preview_tab() -> None:
 
     st.header(f"{home_label} — {away_label}")
     st.caption(f"{match_date} · {tournament}")
+
+    _render_structural_context(home, away, pd.Timestamp(match_date, tz="UTC"))
 
     with st.container(border=True):
         st.subheader("Prognoza wyniku")
@@ -804,15 +1087,24 @@ def _render_match_preview_tab() -> None:
             width="stretch",
         )
 
+    # Head-to-head and streak facts already appear as structured context
+    # above, so they're dropped here rather than repeated -- what's left is
+    # genuinely the trivia this section claims to be.
+    trivia = [
+        fact for fact in facts if fact.fact_type not in _STRUCTURAL_FACT_TYPES
+    ]
     with st.container(border=True):
-        st.subheader("Fakty historyczne")
-        st.caption("Każde zdanie rozwija się do listy meczów, z których powstało.")
-        _render_facts(facts)
+        st.subheader("Nietypowe fakty")
+        st.caption(
+            "Ciekawostki historyczne, nie kontekst meczu — uszeregowane wagą. "
+            "Każde zdanie rozwija się do listy meczów, z których powstało."
+        )
+        _render_facts(trivia)
 
     _render_match_context(prediction)
     _render_export(
         f"{home}-{away}-{match_date}",
-        _prediction_export_text(home_label, away_label, match_date, prediction, facts),
+        _prediction_export_text(home_label, away_label, match_date, prediction, trivia),
     )
     _render_diagnostics(prediction)
 
