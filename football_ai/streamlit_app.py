@@ -24,6 +24,7 @@ import matplotlib
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from PIL import Image
 
 from football_ai.config.settings import get_settings
 from football_ai.data.io import read_table
@@ -46,14 +47,27 @@ from football_ai.simulation.competition import (
 from football_ai.simulation.fixture_input import SimulationInput, build_simulation_input
 from football_ai.simulation.scenarios import what_if_fixed_result
 
-# Working name -- kept in one place so renaming the product is a one-line change.
-_APP_NAME = "TRAFF STATS"
+_APP_NAME = "StatsDesk"
 _APP_TAGLINE = (
     "Prognozy i konteksty meczów reprezentacji narodowych, liczone na realnych "
     "danych historycznych — z możliwością sprawdzenia każdego faktu."
 )
 
-st.set_page_config(page_title=_APP_NAME, page_icon="⚽", layout="wide")
+# Brand assets live as SVG and are rasterised once by
+# `assets/branding/rasterize_logos.py` -- the PNGs are what Streamlit, Plotly
+# and fpdf2 all consume, and none of them needs the SVG.
+_BRANDING_DIRECTORY = Path(__file__).resolve().parent / "assets" / "branding"
+_LOCKUP_DARK = _BRANDING_DIRECTORY / "statsdesk_lockup_dark.png"
+_LOCKUP_LIGHT = _BRANDING_DIRECTORY / "statsdesk_lockup_light.png"
+_MARK = _BRANDING_DIRECTORY / "statsdesk_mark.png"
+_WATERMARK_DARK = _BRANDING_DIRECTORY / "statsdesk_watermark_dark.png"
+_WATERMARK_LIGHT = _BRANDING_DIRECTORY / "statsdesk_watermark_light.png"
+
+st.set_page_config(
+    page_title=_APP_NAME,
+    page_icon=str(_MARK) if _MARK.exists() else "⚽",
+    layout="wide",
+)
 
 # Kept in sync by hand with .streamlit/config.toml -- Streamlit exposes the
 # active theme only through st.get_option(), which returns None when a value
@@ -603,8 +617,54 @@ def _cached_facts(home: str, away: str, as_of_iso: str, top_n: int) -> list[Fact
 # --------------------------------------------------------------------------
 
 
-def _style_figure(figure: go.Figure, height: int) -> go.Figure:
-    """Strip Plotly's default chrome and match the app theme."""
+@st.cache_resource
+def _watermark_image(path_text: str) -> Image.Image | None:
+    """Load a watermark PNG once per process -- Plotly takes a PIL image directly."""
+    path = Path(path_text)
+    if not path.exists():
+        return None
+    return Image.open(path)
+
+
+def _add_watermark(figure: go.Figure, on_light_fill: bool = False) -> go.Figure:
+    """Anchor the StatsDesk watermark in a figure's bottom-right corner.
+
+    `on_light_fill` picks the dark-ink variant, for figures whose own marks
+    are pale -- a heat map's bottom-right corner is a cream cell, not the
+    page background, and the light-ink watermark meant for the dark theme
+    all but disappears on it.
+
+    Opacity is already baked into the PNG (the source SVG sets it), so no
+    extra `opacity` here -- doubling it would wash the mark out completely.
+    """
+    source = _WATERMARK_LIGHT if on_light_fill else _WATERMARK_DARK
+    watermark = _watermark_image(str(source))
+    if watermark is None:
+        return figure
+    figure.add_layout_image(
+        source=watermark,
+        xref="paper",
+        yref="paper",
+        x=1,
+        y=0,
+        sizex=0.12,
+        sizey=0.12,
+        xanchor="right",
+        yanchor="bottom",
+        layer="above",
+    )
+    return figure
+
+
+def _style_figure(
+    figure: go.Figure, height: int, watermark_on_light_fill: bool = False
+) -> go.Figure:
+    """Strip Plotly's default chrome, match the app theme, and stamp the watermark.
+
+    The watermark is applied here rather than at each `st.plotly_chart` call
+    because every figure in the app already funnels through this function --
+    so a chart added later cannot silently ship unbranded.
+    """
     figure.update_layout(
         height=height,
         margin=dict(l=10, r=10, t=10, b=10),
@@ -615,7 +675,7 @@ def _style_figure(figure: go.Figure, height: int) -> go.Figure:
         xaxis=dict(showgrid=False, zeroline=False),
         yaxis=dict(showgrid=False, zeroline=False),
     )
-    return figure
+    return _add_watermark(figure, on_light_fill=watermark_on_light_fill)
 
 
 def _outcome_chart(
@@ -787,7 +847,7 @@ def _heatmap_figure(
     )
     figure.update_layout(annotations=annotations)
     figure.update_yaxes(autorange="reversed")
-    return _style_figure(figure, height=height)
+    return _style_figure(figure, height=height, watermark_on_light_fill=True)
 
 
 def _score_grid_figure(
@@ -1185,8 +1245,24 @@ def _build_analysis_pdf(
     """One-page PDF of the analysis on screen, for sending on to an editor."""
     from fpdf import FPDF
 
-    document = FPDF(format="A4")
-    document.set_auto_page_break(auto=True, margin=16)
+    class _BrandedPDF(FPDF):
+        """A4 document that stamps the StatsDesk watermark on every page.
+
+        Implemented as a `footer()` override rather than drawn once after the
+        content: fpdf2 calls `footer()` for each page as it is closed, so a
+        document that grows to two pages still carries the mark on both --
+        which is the entire point of it being an anti-reuse measure.
+        """
+
+        def footer(self) -> None:
+            """Draw the light-background watermark just above the bottom margin."""
+            if not _WATERMARK_LIGHT.exists():
+                return
+            self.set_y(-18)
+            self.image(str(_WATERMARK_LIGHT), x=self.w - 46, w=32)
+
+    document = _BrandedPDF(format="A4")
+    document.set_auto_page_break(auto=True, margin=22)
     document.add_page()
     font_path = str(_unicode_font_path())
     document.add_font("DejaVu", "", font_path)
@@ -1201,7 +1277,13 @@ def _build_analysis_pdf(
         # zero space left and raises "Not enough horizontal space".
         document.multi_cell(0, gap, text, new_x="LMARGIN", new_y="NEXT")
 
-    write(_APP_NAME, size=9, style="B", gap=5)
+    if _LOCKUP_LIGHT.exists():
+        # The PDF page is white, so this is the `_light` variant -- the dark
+        # one would be near-invisible on it.
+        document.image(str(_LOCKUP_LIGHT), x=document.l_margin, y=10, w=52)
+        document.set_y(28)
+    else:
+        write(_APP_NAME, size=9, style="B", gap=5)
     write(f"{home_label} — {away_label}", size=17, style="B", gap=9)
     write(f"{match_date} · {tournament}", size=9)
     document.ln(2)
@@ -2210,16 +2292,27 @@ def _render_what_if(
 
 
 def _render_header() -> None:
-    """Centred product name, one thin line of description, PDF export on the right."""
+    """Centred brand lockup, one thin line of description, PDF export on the right."""
     title_column, export_column = st.columns([5, 1])
     with title_column:
+        if _LOCKUP_DARK.exists():
+            # Centred via columns rather than CSS: st.image has no alignment
+            # option, and the surrounding page is a dark theme, so this is the
+            # `_dark` variant of the lockup.
+            left_pad, logo_column, right_pad = st.columns([1, 2, 1])
+            with logo_column:
+                st.image(str(_LOCKUP_DARK), width=280)
+            _ = (left_pad, right_pad)
+        else:
+            st.markdown(
+                f"<div style='text-align:center;font-size:2.6rem;font-weight:700'>"
+                f"{_APP_NAME}</div>",
+                unsafe_allow_html=True,
+            )
         st.markdown(
-            f"<div style='text-align:center'>"
-            f"<div style='font-size:2.6rem;font-weight:700;letter-spacing:0.06em'>"
-            f"{_APP_NAME}</div>"
-            f"<div style='font-size:0.85rem;"
+            f"<div style='text-align:center;font-size:0.85rem;"
             f"color:{_MUTED_TEXT_COLOUR};margin-top:0.2rem'>"
-            f"{_APP_TAGLINE}</div></div>",
+            f"{_APP_TAGLINE}</div>",
             unsafe_allow_html=True,
         )
     with export_column:
