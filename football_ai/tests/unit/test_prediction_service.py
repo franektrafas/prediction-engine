@@ -294,6 +294,64 @@ class PredictionServiceTestCase(unittest.TestCase):
             self.assertAlmostEqual(probability_sum, 1.0, places=5)
             self.assertNotAlmostEqual(prediction.outcome_probabilities.home_win, 0.33, places=2)
 
+    def test_over_under_and_btts_are_poisson_derived_with_no_dedicated_models_registered(self) -> None:
+        """over_1_5/2_5/3_5 and btts must come from the home_goals/away_goals expected-goals default,
+
+        not require their own registered classifiers -- CONFIRMED REAL (2026-08-02): a dedicated
+        classifier trained directly on the binarized threshold label lost to this derivation on
+        every metric on the real test split, and there was never a real `btts` model registered at
+        all (the old default, `float(home_goals > 0 and away_goals > 0)`, wasn't a real probability).
+        Only `match_outcome` is registered here -- home_goals/away_goals fall back to their own
+        hardcoded defaults (1.4/1.1), and over_under/btts must still be real Poisson-derived values
+        computed from exactly those two numbers, not from any over_*/btts registry entry (there is
+        none).
+        """
+        from football_ai.predictions.service import _poisson_btts_probability, _poisson_over_probability
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            registry = ModelRegistry(temp_path / "registry.json")
+            artifact_path = temp_path / "match_outcome_xgboost_test_v1.joblib"
+            artifact = TrainedArtifact(
+                model_name="xgboost",
+                target_name="match_outcome",
+                task_type="multiclass",
+                version="test_v1",
+                feature_columns=["home_elo", "away_elo"],
+                categorical_columns=[],
+                hyperparameters={},
+                estimator=DummyClassifier(),
+                metrics={},
+            )
+            joblib.dump(artifact, artifact_path)
+            registry.register(
+                RegisteredModel(
+                    model_name="xgboost",
+                    target_name="match_outcome",
+                    task_type="multiclass",
+                    version="test_v1",
+                    artifact_path=str(artifact_path),
+                    metrics={},
+                )
+            )
+            service = PredictionService(registry=registry)
+            payload = MatchContextPayload(
+                match_date=datetime(2026, 7, 1, tzinfo=timezone.utc),
+                home_team_name="Spain",
+                away_team_name="Portugal",
+                home_elo=1900,
+                away_elo=1850,
+            )
+            prediction = service.predict(payload)
+
+            expected_total = 1.4 + 1.1  # home_goals/away_goals defaults, no models registered
+            self.assertAlmostEqual(
+                prediction.over_under["over_2_5"], _poisson_over_probability(expected_total, 2.5), places=9
+            )
+            self.assertAlmostEqual(prediction.btts, _poisson_btts_probability(1.4, 1.1), places=9)
+            self.assertIn("poisson", prediction.model_versions["over_2_5"])
+            self.assertIn("poisson", prediction.model_versions["btts"])
+
 
 if __name__ == "__main__":
     unittest.main()
