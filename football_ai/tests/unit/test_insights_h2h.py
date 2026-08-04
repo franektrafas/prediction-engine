@@ -7,6 +7,12 @@ first, is a 1933 loss then nothing but losses/draws until a 2014-10-11 2-0
 win (their first ever) and a second win on 2023-06-16. That real sequence
 is embedded below as a small fixture so the suite runs without the
 gitignored records_frame file.
+
+Poland-Bosnia and Herzegovina (verified for real, 2026-08-04) is the
+fixture behind the "pierwszy raz od 0 lat" bug: Poland beat them twice in
+2020 (2020-09-07 and 2020-10-14, a Nations League home-and-away pair) --
+five weeks apart but the same calendar year, so naive `year - year`
+subtraction produced a gap of 0 and nonsensical Polish narrative text.
 """
 
 from __future__ import annotations
@@ -29,6 +35,15 @@ _POLAND_GERMANY_REAL_ROWS = [
     (4, "2011-09-06", "Poland", "Germany", 2, 2),
     (5, "2014-10-11", "Poland", "Germany", 2, 0),  # Poland's first-ever win
     (6, "2023-06-16", "Poland", "Germany", 1, 0),  # Poland's second win
+]
+
+# Poland-Bosnia and Herzegovina, real matches (verbatim from the real
+# records_frame, 2026-08-04): a 2010 draw, then two Poland wins five weeks
+# apart in 2020 -- the exact real trigger for the "0 lat" bug.
+_POLAND_BOSNIA_REAL_ROWS = [
+    (10, "2010-12-10", "Bosnia and Herzegovina", "Poland", 2, 2),
+    (11, "2020-09-07", "Bosnia and Herzegovina", "Poland", 1, 2),
+    (12, "2020-10-14", "Poland", "Bosnia and Herzegovina", 3, 0),
 ]
 
 
@@ -104,6 +119,18 @@ class H2hGoldenTestCase(unittest.TestCase):
         """Provenance for the 9-year-gap fact must cover both wins and everything in between, reproducibly."""
         fact = first_win_since(_frame(_POLAND_GERMANY_REAL_ROWS), "Poland", "Germany")
         self.assertEqual(fact.provenance, (5, 6))
+
+    def test_two_wins_in_the_same_calendar_year_report_no_gap_fact(self) -> None:
+        """Real bug fixture: two 2020 wins over Bosnia and Herzegovina must not yield "0 lat".
+
+        Naive `year - year` subtraction gave `gap_years = 2020 - 2020 = 0`,
+        which the Polish template rendered as "pierwszy raz od 0 lat" --
+        nonsensical, since five weeks apart is not a "gap" at all. There is
+        genuinely nothing notable to report about this win's timing, so the
+        fact must be suppressed (None), not emitted with a bogus gap.
+        """
+        fact = first_win_since(_frame(_POLAND_BOSNIA_REAL_ROWS), "Poland", "Bosnia and Herzegovina")
+        self.assertIsNone(fact)
 
 
 if __name__ == "__main__":

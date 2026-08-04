@@ -88,24 +88,32 @@ def first_win_since(
     if prior_wins.empty:
         gap_summary = f"{canon_a}'s only win against {canon_b} on record came in {int(most_recent_win['match_date'].year)}"
         provenance = tuple(int(match_id) for match_id in matches["match_id"])
+        gap_years = None
     else:
         previous_win_year = int(prior_wins.iloc[-1]["match_date"].year)
         most_recent_win_year = int(most_recent_win["match_date"].year)
+        gap_years = most_recent_win_year - previous_win_year
+        if gap_years == 0:
+            # Both wins landed in the same calendar year -- confirmed real
+            # case: Poland beat Bosnia and Herzegovina twice in 2020
+            # (2020-09-07 and 2020-10-14, a Nations League home-and-away
+            # pair), five weeks apart. There's no drought to report here,
+            # so this isn't a rounding edge case to patch up -- this fact
+            # type genuinely has nothing to say about this win. Naive
+            # calendar-year subtraction rendered "pierwszy raz od 0 lat"
+            # (nonsensical Polish for a gap that was never a gap).
+            return None
         gap_summary = (
             f"{canon_a}'s {most_recent_win_year} win against {canon_b} was their first since {previous_win_year}"
         )
         # Provenance: the two bracketing wins plus every match in between --
         # reproducible end to end, not just "trust the gap number".
         gap_matches = matches.loc[
-            (matches["match_date"] >= prior_wins.iloc[-1]["match_date"]) & (matches["match_date"] <= most_recent_win["match_date"])
+            (matches["match_date"] >= prior_wins.iloc[-1]["match_date"])
+            & (matches["match_date"] <= most_recent_win["match_date"])
         ]
         provenance = tuple(int(match_id) for match_id in gap_matches["match_id"])
 
-    gap_years = (
-        int(most_recent_win["match_date"].year) - int(prior_wins.iloc[-1]["match_date"].year)
-        if not prior_wins.empty
-        else None
-    )
     return Fact(
         fact_type="h2h_first_win_since",
         subject_team=canon_a,
