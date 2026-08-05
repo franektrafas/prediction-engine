@@ -38,6 +38,10 @@ from football_ai.predictions.schemas import MatchContextPayload, PredictionRespo
 from football_ai.predictions.service import PredictionService
 from football_ai.scrapers.sources.elo import WorldFootballEloSource
 from football_ai.scrapers.sources.football_api import FootballApiSource
+from football_ai.scrapers.sources.team_recent_results_wikipedia import (
+    TeamRecentResultsWikipediaSource,
+    empty_recent_results,
+)
 from football_ai.scrapers.sources.uefa_nations_league import UefaNationsLeagueSource
 from football_ai.simulation.competition import (
     compute_standings,
@@ -48,6 +52,14 @@ from football_ai.simulation.fixture_input import SimulationInput, build_simulati
 from football_ai.simulation.scenarios import what_if_fixed_result
 
 _APP_NAME = "StatsDesk"
+# One Wikipedia fetch returns the team's whole 2020-present page anyway, so
+# parsing all of it costs nothing extra; the *displayed* enrichment stays
+# inside the form window, and the full set is used only to tell whether a
+# referee is a repeat visitor (see `_referee_appearance_count`).
+_WIKIPEDIA_PAGE_LIMIT = 500
+# Below this many matches together, "this referee has taken charge of them
+# before" is an anecdote, not a pattern -- so it isn't shown at all.
+_MINIMUM_REFEREE_APPEARANCES = 3
 _APP_TAGLINE = (
     "Prognozy i konteksty meczów reprezentacji narodowych, liczone na realnych "
     "danych historycznych — z możliwością sprawdzenia każdego faktu."
@@ -527,6 +539,105 @@ def _cached_recent_form(team: str, as_of_iso: str, limit: int = 10) -> pd.DataFr
     """A team's most recent matches, oldest first, goals_for/against attached."""
     matches = streaks.team_matches(_load_records_frame(), team, pd.Timestamp(as_of_iso))
     return matches.tail(limit)
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _cached_wikipedia_results(team: str) -> pd.DataFrame:
+    """Attendance/referee for recent matches; one Wikipedia fetch per six hours.
+
+    Long TTL because this is the slowest thing the app touches (a real HTTP
+    round trip) and the least volatile -- a played match's attendance never
+    changes. Degrades to an empty frame on any failure, so every caller can
+    treat "we have nothing for this team" and "the fetch broke" identically.
+    """
+    try:
+        source = TeamRecentResultsWikipediaSource()
+        return source.fetch_recent_results(team, limit=_WIKIPEDIA_PAGE_LIMIT)
+    except Exception:
+        return empty_recent_results()
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _wikipedia_details_by_date(team: str) -> dict[date, dict[str, object]]:
+    """`{match date: {attendance, referee, goals_for, goals_against}}` for one team.
+
+    Keyed on date alone: a national team plays at most once a day, and the
+    opponent name is the one field that *can't* be relied on to match -- the
+    FIFA code table here is UEFA-shaped, so Wikipedia's `{{fb|NGA}}` stays
+    "NGA" where the records frame says "Nigeria". Callers verify the join by
+    score instead (see `_wikipedia_match_detail`).
+    """
+    frame = _cached_wikipedia_results(team)
+    if frame.empty:
+        return {}
+    return {
+        pd.Timestamp(row["match_date"]).date(): {
+            "attendance": row["attendance"],
+            "referee": row["referee"],
+            "goals_for": row["goals_for"],
+            "goals_against": row["goals_against"],
+        }
+        for _, row in frame.iterrows()
+    }
+
+
+def _wikipedia_match_detail(
+    team: str, match_date: date, goals_for: float, goals_against: float
+) -> dict[str, object] | None:
+    """One match's attendance/referee, if the score confirms it's that match.
+
+    The date join is near-certain on its own; requiring the score to agree
+    makes it self-checking, so a mismatch between the two sources shows up
+    as missing enrichment rather than as a confidently-wrong attendance
+    figure attached to the wrong game.
+    """
+    detail = _wikipedia_details_by_date(team).get(match_date)
+    if detail is None:
+        return None
+    recorded = (int(goals_for), int(goals_against))
+    if (detail["goals_for"], detail["goals_against"]) != recorded:
+        return None
+    return detail
+
+
+def _format_match_detail(detail: dict[str, object] | None) -> str:
+    """The muted `12 345 widzów · Sędzia (Kraj)` suffix, or an empty string.
+
+    Empty is deliberate: a match with neither field shows nothing at all,
+    not a placeholder. Attendance of 0 is a real figure (COVID
+    behind-closed-doors) and must still render, which is why this tests for
+    None rather than truthiness.
+    """
+    if detail is None:
+        return ""
+    parts: list[str] = []
+    attendance = detail.get("attendance")
+    if attendance is not None and not pd.isna(attendance):
+        count = int(attendance)
+        spectators = _plural_pl(count, "widz", "widzów", "widzów")
+        parts.append(f"{count:,}".replace(",", " ") + f" {spectators}")
+    referee = detail.get("referee")
+    if referee is not None and not pd.isna(referee):
+        parts.append(f"sędzia: {referee}")
+    return " · ".join(parts)
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _referee_appearance_count(team: str, referee: str) -> int:
+    """How many of this team's matches on record that referee has taken charge of.
+
+    Counted over the whole page (2020-present), not the ten-match form
+    window, because MEASURED (2026-08-04) the window is always empty: across
+    Poland, Germany, England, Malta, Andorra and Japan, no referee appears
+    even twice in a team's last 15 matches. Over the full page the same
+    check finds only 1-5 such referees per team out of 48-65 distinct ones
+    -- rare enough to be worth remarking on when it happens, which is
+    exactly why it needs a floor rather than being shown for every match.
+    """
+    frame = _cached_wikipedia_results(team)
+    if frame.empty or not referee:
+        return 0
+    return int((frame["referee"] == referee).sum())
 
 
 @st.cache_data(show_spinner=False)
@@ -1080,21 +1191,72 @@ def _render_team_form(team: str, as_of: pd.Timestamp) -> None:
     )
 
     with st.expander(f"Pełna forma: {label}", expanded=False):
-        st.dataframe(
-            pd.DataFrame(
-                [
-                    {
-                        "Data": pd.Timestamp(row["match_date"]).date(),
-                        "Przeciwnik": nominative_pl(str(row["opponent"])),
-                        "Wynik": f"{int(row['goals_for'])}:{int(row['goals_against'])}",
-                        "Gdzie": "dom" if bool(row["is_home"]) else "wyjazd",
-                    }
-                    for _, row in form.iloc[::-1].iterrows()
-                ]
-            ),
-            width="stretch",
-            hide_index=True,
-        )
+        rows: list[dict[str, object]] = []
+        for _, row in form.iloc[::-1].iterrows():
+            entry: dict[str, object] = {
+                "Data": pd.Timestamp(row["match_date"]).date(),
+                "Przeciwnik": nominative_pl(str(row["opponent"])),
+                "Wynik": f"{int(row['goals_for'])}:{int(row['goals_against'])}",
+                "Gdzie": "dom" if bool(row["is_home"]) else "wyjazd",
+            }
+            detail = _wikipedia_match_detail(
+                team,
+                pd.Timestamp(row["match_date"]).date(),
+                row["goals_for"],
+                row["goals_against"],
+            )
+            if detail is not None:
+                attendance = detail.get("attendance")
+                if attendance is not None and not pd.isna(attendance):
+                    entry["Frekwencja"] = int(attendance)
+                referee = detail.get("referee")
+                if referee is not None and not pd.isna(referee):
+                    entry["Sędzia"] = str(referee)
+            rows.append(entry)
+        # Columns appear only where the source actually has them: a team
+        # whose page Wikipedia doesn't carry gets the original four columns,
+        # not two empty ones implying we lost the data.
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+
+def _render_match_officials(home: str, away: str, match_date: date) -> None:
+    """The match referee, when a source actually knows it -- otherwise nothing at all.
+
+    MEASURED (2026-08-04): for a genuinely *upcoming* match no source here
+    has the appointment. api-football carries no referee field on this plan,
+    and Wikipedia's own not-yet-played blocks leave `referee` blank in 9 of
+    9 cases on both Poland's and Germany's pages -- appointments land days
+    before kickoff, after the article is written. So this line stays silent
+    on previews and fills in for matches already played, which the app can
+    equally be pointed at. If a schedule source ever starts publishing
+    appointments, it lights up with no further change here.
+    """
+    referee = None
+    for team in (home, away):
+        detail = _wikipedia_details_by_date(team).get(match_date)
+        if not detail:
+            continue
+        if detail.get("referee") is not None and not pd.isna(detail["referee"]):
+            referee = str(detail["referee"])
+            break
+    if referee is None:
+        return
+
+    line = f"Sędzia: **{referee}**"
+    # Phrased as a tally rather than a sentence on purpose: the team-name
+    # table carries nominative/dative/accusative but no genitive, and
+    # "prowadził mecze Polski" needs one. A label-and-count line reads
+    # naturally with the nominative that does exist, instead of inflecting
+    # by hand and getting it wrong for half the table.
+    notes = []
+    for team in (home, away):
+        appearances = _referee_appearance_count(team, referee)
+        if appearances >= _MINIMUM_REFEREE_APPEARANCES:
+            matches_word = _plural_pl(appearances, "mecz", "mecze", "meczów")
+            notes.append(f"{nominative_pl(team)} — {appearances} {matches_word}")
+    if notes:
+        line = f"{line} · prowadził już: {', '.join(notes)} (od 2020)"
+    st.caption(line)
 
 
 def _render_structural_context(home: str, away: str, as_of: pd.Timestamp) -> None:
@@ -1650,6 +1812,7 @@ def _render_match_preview_tab() -> None:
 
     st.header(f"{home_label} — {away_label}")
     st.caption(f"{match_date} · {tournament}")
+    _render_match_officials(home, away, match_date)
 
     _warn_on_missing_elo(home, away)
     _render_structural_context(home, away, pd.Timestamp(match_date, tz="UTC"))
@@ -2016,6 +2179,18 @@ def _render_recap_tab() -> None:
             f"{int(result_row['home_score'])} : {int(result_row['away_score'])}</div>",
             unsafe_allow_html=True,
         )
+        # Silent when Wikipedia has nothing for this match -- no placeholder,
+        # no "brak danych", just the score on its own as before.
+        detail_text = _format_match_detail(
+            _wikipedia_match_detail(
+                home,
+                match_date,
+                int(result_row["home_score"]),
+                int(result_row["away_score"]),
+            )
+        )
+        if detail_text:
+            st.caption(detail_text)
 
     _render_match_statistics(result_row, home_label, away_label)
     _render_goalscorers(int(stored_match_id), home, away)

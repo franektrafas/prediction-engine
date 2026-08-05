@@ -130,15 +130,34 @@ def _extract_group_section(wikitext: str, group_number: int) -> str | None:
     return None
 
 
-def _find_balanced_template_blocks(wikitext: str, template_name: str) -> list[str]:
-    """Extract every `{{template_name ... }}` block, tracking brace depth so nested templates don't truncate it early."""
+def _find_balanced_template_blocks(
+    wikitext: str, template_name: str, case_sensitive: bool = True
+) -> list[str]:
+    """Extract every `{{template_name ... }}` block, tracking brace depth so nested templates don't truncate it early.
+
+    `case_sensitive=False` is for pages that spell the same template both
+    ways -- the per-team results pages mix `{{Football box collapsible}}`
+    and `{{football box collapsible}}` in one article (measured on Poland's
+    2020-present page, 2026-08-04: 56 capitalised, 26 not). Default stays
+    case-sensitive so the Nations League parser above is untouched.
+
+    Matching is done with a case-insensitive regex rather than by searching
+    a lowercased copy, because `str.lower()` is not length-preserving:
+    Japan's results page contains `İ` (U+0130, in a Turkish referee's
+    name), which lowercases to two codepoints and shifted every subsequent
+    offset by one -- slicing blocks a character late, so they began `{F`
+    instead of `{{F` and the brace walk truncated them mid-template. Found
+    for real, 2026-08-04.
+    """
     blocks: list[str] = []
     marker = "{{" + template_name
+    pattern = re.compile(re.escape(marker), 0 if case_sensitive else re.IGNORECASE)
     search_start = 0
     while True:
-        start = wikitext.find(marker, search_start)
-        if start == -1:
+        found = pattern.search(wikitext, search_start)
+        if found is None:
             break
+        start = found.start()
         depth = 0
         index = start
         end = None
