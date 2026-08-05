@@ -17,9 +17,26 @@ instead of being quietly presented as model output.
 from __future__ import annotations
 
 import math
+import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+# CONFIRMED REAL (2026-08-05): `streamlit run football_ai/streamlit_app.py`
+# fails with `ModuleNotFoundError: No module named 'football_ai'` on a bare
+# `pip install -e .` -- this venv's `.pth` file is never actually processed
+# (verified: even a throwaway marker `.pth` dropped into site-packages
+# never appears in `sys.path`, editable-install mode aside), so the package
+# is only importable by accident when the *current directory* happens to be
+# the repo root. Streamlit's script runner points `sys.path[0]` at this
+# file's own directory (`football_ai/`) instead, which breaks that accident.
+# Fixed at the source rather than by requiring callers to set `PYTHONPATH`
+# -- `streamlit run football_ai/streamlit_app.py` then works from anywhere,
+# regardless of this machine's editable-install state.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+# ruff: noqa: E402 -- imports below must follow the sys.path fix above.
 import matplotlib
 import pandas as pd
 import plotly.graph_objects as go
@@ -203,6 +220,37 @@ _RESULT_MARKER_STYLES: dict[str, tuple[str, str]] = {
     "R": ("#c2c6cc", "#262a30"),
     "P": ("#d4a99a", "#3d2019"),
 }
+
+# Numeric rows for the per-team metrics heat map (label, records_frame stat,
+# cell text format) -- shown only where a majority of the rendered matches
+# actually have the data (see `_row_has_majority_coverage`). "Gole
+# strzelone"/"Gole stracone" aren't here because they're core to every
+# played match and always shown; "cards" is synthetic (yellow + red summed).
+_TEAM_METRIC_ROW_SPECS: tuple[tuple[str, str, str], ...] = (
+    ("Posiadanie piłki (%)", "possession_pct", "{:.0f}%"),
+    ("Strzały celne", "shots_on_target", "{:.0f}"),
+    ("Kartki (Ż+Cz)", "cards", "{:.0f}"),
+)
+_MISSING_CELL_TEXT = "brak"
+
+# A darker top stop than `_heatmap_figure`'s shared gold scale (#5c4a12):
+# this grid pairs cell text with pure black/white (`_readable_cell_text_color`)
+# rather than the app's branded off-white/off-black. MEASURED (2026-08-05):
+# the branded pair (#f2ede0/#20242c) falls as low as 3.65:1 mid-scale --
+# neither is extreme enough to guarantee 4.5:1 against a colour whose
+# luminance sits near the black/white "crossover" point. Pure black/white
+# is: the worst point achievable by *any* choice of the better of the two,
+# at any luminance, is a fixed 4.583:1 (solving contrast-to-black ==
+# contrast-to-white), and this ramp's true worst point measures 4.590:1 --
+# essentially that theoretical floor, not a coincidence of this particular
+# endpoint. No darker/lighter endpoint choice can do meaningfully better
+# with a binary black/white pairing; it clears WCAG's 4.5:1 with real
+# margin regardless of exactly where the ramp's dark stop sits.
+_METRIC_HEATMAP_COLORSCALE: tuple[tuple[float, str], ...] = (
+    (0.0, "#f0ead9"),
+    (0.5, "#c9a227"),
+    (1.0, "#3a2c08"),
+)
 
 _MATCH_CONTEXT_LABELS_PL: dict[str, tuple[str, str]] = {
     "home_injured_market_value": ("Wartość kontuzjowanych (gospodarz)", "money"),
@@ -911,6 +959,58 @@ def _format_date_header_pl(day: date) -> str:
     return f"{_WEEKDAYS_PL[day.weekday()]}, {day.day} {month}"
 
 
+def _relative_luminance(hex_color: str) -> float:
+    """WCAG relative luminance of a `#rrggbb` colour, for contrast-ratio math."""
+
+    def channel(value: int) -> float:
+        fraction = value / 255
+        if fraction <= 0.04045:
+            return fraction / 12.92
+        return ((fraction + 0.055) / 1.055) ** 2.4
+
+    red, green, blue = (int(hex_color[i : i + 2], 16) for i in (1, 3, 5))
+    return 0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue)
+
+
+def _readable_cell_text_color(background_hex: str) -> str:
+    """Pure black or white, whichever clears WCAG contrast against `background_hex`.
+
+    `0.1791` is the luminance where contrast-to-black equals contrast-to-
+    white (solving `(L + 0.05) / 0.05 == 1.05 / (L + 0.05)`), so this always
+    picks whichever of the two is actually better for a given cell -- not a
+    fixed light-half/dark-half split, which is what let a branded-colour
+    version fall short of 4.5:1 partway along its own ramp (see
+    `_METRIC_HEATMAP_COLORSCALE`'s comment).
+    """
+    return "#000000" if _relative_luminance(background_hex) > 0.1791 else "#ffffff"
+
+
+def _lerp_hex_color(start_hex: str, end_hex: str, t: float) -> str:
+    """Linear interpolation between two `#rrggbb` colours."""
+    start = [int(start_hex[i : i + 2], 16) for i in (1, 3, 5)]
+    end = [int(end_hex[i : i + 2], 16) for i in (1, 3, 5)]
+    mixed = [round(s + (e - s) * t) for s, e in zip(start, end, strict=True)]
+    return "#" + "".join(f"{value:02x}" for value in mixed)
+
+
+def _metric_heatmap_cell_color(t: float) -> str:
+    """The exact hex colour `_METRIC_HEATMAP_COLORSCALE` renders at position `t` (0..1).
+
+    Plotly computes this internally for the chart itself, but a cell's text
+    colour has to be picked in Python before the figure is built.
+    """
+    stops = _METRIC_HEATMAP_COLORSCALE
+    clamped = min(max(t, 0.0), 1.0)
+    for (start_t, start_color), (end_t, end_color) in zip(
+        stops, stops[1:], strict=False
+    ):
+        if clamped <= end_t:
+            span = end_t - start_t
+            local_t = (clamped - start_t) / span if span > 0 else 0.0
+            return _lerp_hex_color(start_color, end_color, local_t)
+    return stops[-1][1]
+
+
 def _heatmap_figure(
     matrix: list[list[float]],
     x_labels: list[str],
@@ -1045,18 +1145,267 @@ def _result_letter(goals_for: float, goals_against: float) -> str:
     return "P"
 
 
-def _form_markers_html(letters: list[str]) -> str:
-    """A row of W/R/P squares, oldest on the left."""
-    markers = []
-    for letter in letters:
-        background, foreground = _RESULT_MARKER_STYLES[letter]
-        markers.append(
-            f"<span style='display:inline-flex;align-items:center;"
-            f"justify-content:center;width:22px;height:22px;margin-right:4px;"
-            f"border-radius:4px;background:{background};color:{foreground};"
-            f"font-weight:700;font-size:12px;font-family:sans-serif'>{letter}</span>"
+def _team_metric_value(row: pd.Series, base: str) -> float | None:
+    """This team's own value for one stat column, picking home_*/away_* by `is_home`.
+
+    `base="cards"` is synthetic -- yellow and red summed -- everything else
+    maps straight onto a `home_<base>`/`away_<base>` records_frame column.
+    """
+    prefix = "home_" if bool(row["is_home"]) else "away_"
+    if base == "cards":
+        yellow = row.get(f"{prefix}yellow_cards")
+        red = row.get(f"{prefix}red_cards")
+        if pd.isna(yellow) and pd.isna(red):
+            return None
+        yellow_count = 0.0 if pd.isna(yellow) else float(yellow)
+        red_count = 0.0 if pd.isna(red) else float(red)
+        return yellow_count + red_count
+    value = row.get(f"{prefix}{base}")
+    return None if pd.isna(value) else float(value)
+
+
+def _row_has_majority_coverage(form: pd.DataFrame, base: str) -> bool:
+    """True when more than half of the rendered matches have real data for `base`.
+
+    Checked against the actual window being shown (however many matches that
+    is, not a fixed ten) -- a team with 4 matches on record and 3 with data
+    still shows the row. Krok 0 found this stat family moves together as one
+    block from one source and is frequently absent entirely for a given
+    team/era, never worth half-showing.
+    """
+    present = sum(
+        _team_metric_value(row, base) is not None for _, row in form.iterrows()
+    )
+    return present * 2 > len(form)
+
+
+def _normalize_row(values: list[float | None]) -> list[float | None]:
+    """Scale one row's values into 0..1 for a shared colorscale; `None` stays `None`.
+
+    Normalized *per row*, deliberately not globally: intensity means "high
+    relative to this team's own matches shown for this metric", not "high
+    compared to some other metric or another team" -- those aren't
+    comparable scales.
+    """
+    present = [value for value in values if value is not None]
+    if not present:
+        return [None for _ in values]
+    low, high = min(present), max(present)
+    if high == low:
+        return [None if value is None else 0.5 for value in values]
+    return [None if value is None else (value - low) / (high - low) for value in values]
+
+
+def _team_metric_heatmap_rows(
+    form: pd.DataFrame,
+) -> list[tuple[str, list[float | None], str]]:
+    """Label, per-match values (oldest first) and cell-text format, per covered row.
+
+    "Gole strzelone"/"Gole stracone" always appear -- goals are core to
+    every played match. The rest appear only with real per-team coverage in
+    this window (see `_row_has_majority_coverage`).
+    """
+    def _numeric_column(column: str) -> list[float | None]:
+        return [None if pd.isna(value) else float(value) for value in form[column]]
+
+    rows: list[tuple[str, list[float | None], str]] = [
+        ("Gole strzelone", _numeric_column("goals_for"), "{:.0f}"),
+        ("Gole stracone", _numeric_column("goals_against"), "{:.0f}"),
+    ]
+    for label, base, cell_format in _TEAM_METRIC_ROW_SPECS:
+        if not _row_has_majority_coverage(form, base):
+            continue
+        values = [_team_metric_value(row, base) for _, row in form.iterrows()]
+        rows.append((label, values, cell_format))
+    return rows
+
+
+def _team_metric_heatmap_figure(form: pd.DataFrame) -> go.Figure:
+    """The combined Wynik + metrics grid: columns are matches, rows are metrics.
+
+    Drawn as explicit per-cell rectangle shapes, not a Heatmap trace's
+    z/colorscale. CONFIRMED REAL (2026-08-05, live browser): two Heatmap
+    traces sharing one categorical axis -- meant to combine "Wynik"'s fixed
+    three-hue scale with the metric rows' continuous, per-row-normalized
+    one -- rendered as a blank chart, not the merged grid a shared axis was
+    assumed to produce. Shapes sidestep that: every cell's colour is
+    computed in Python and drawn directly, nothing left for Plotly to merge.
+    Columns use explicit numeric positions with custom tick text rather
+    than date strings as `x` -- also confirmed real, separately, on the
+    attendance chart below: Plotly auto-detects axis type from the data, and
+    "26.03"-shaped strings get silently parsed as the *number* 26.03,
+    scrambling both position and chronological order.
+    """
+    dates = [pd.Timestamp(value).date() for value in form["match_date"]]
+    x_labels = [single_date.strftime("%d.%m") for single_date in dates]
+    letters = [
+        _result_letter(row["goals_for"], row["goals_against"])
+        for _, row in form.iterrows()
+    ]
+    metric_rows = _team_metric_heatmap_rows(form)
+    row_labels = ["Wynik"] + [label for label, _, _ in metric_rows]
+    n_columns = len(x_labels)
+    n_rows = len(row_labels)
+
+    shapes: list[dict[str, object]] = []
+    annotations: list[dict[str, object]] = []
+    inset = 0.07  # a thin gap between cells, echoing the old xgap/ygap=2
+
+    def add_cell(
+        row_index: int,
+        column_index: int,
+        fill_color: str,
+        text: str,
+        text_color: str,
+    ) -> None:
+        # Always a filled rect, missing cells included: a "brak" label with
+        # no cell boundary at all crowds visually into its neighbour,
+        # especially with two missing cells side by side -- confirmed real,
+        # 2026-08-05 -- and doesn't match the brief's own "puste/wyszarzone"
+        # (empty/*greyed*) wording, which implies a visible muted fill, not
+        # literally nothing.
+        shapes.append(
+            dict(
+                type="rect",
+                xref="x",
+                yref="y",
+                x0=column_index - 0.5 + inset,
+                x1=column_index + 0.5 - inset,
+                y0=row_index - 0.5 + inset,
+                y1=row_index + 0.5 - inset,
+                fillcolor=fill_color,
+                line=dict(width=0),
+            )
         )
-    return f"<div style='display:flex;flex-wrap:wrap'>{''.join(markers)}</div>"
+        # "brak" (4 letters) is wider than almost every real value a cell
+        # holds ("0", "73%") and visibly overflowed its column at size 12 --
+        # confirmed real, 2026-08-05, live browser -- so longer labels drop
+        # a size to fit ~10 columns' worth of cell width.
+        font_size = 10 if len(text) > 3 else 12
+        annotations.append(
+            dict(
+                x=column_index,
+                y=row_index,
+                text=text,
+                showarrow=False,
+                font=dict(color=text_color, size=font_size, family="Georgia, serif"),
+            )
+        )
+
+    for column_index, letter in enumerate(letters):
+        background, foreground = _RESULT_MARKER_STYLES[letter]
+        add_cell(0, column_index, background, letter, foreground)
+
+    for row_index, (_, values, cell_format) in enumerate(metric_rows, start=1):
+        normalized = _normalize_row(values)
+        paired = enumerate(zip(values, normalized, strict=True))
+        for column_index, (raw_value, norm_value) in paired:
+            if raw_value is None:
+                add_cell(
+                    row_index,
+                    column_index,
+                    _GRID_COLOUR,
+                    _MISSING_CELL_TEXT,
+                    _MUTED_TEXT_COLOUR,
+                )
+            else:
+                text = cell_format.format(raw_value)
+                cell_color = _metric_heatmap_cell_color(norm_value)
+                text_color = _readable_cell_text_color(cell_color)
+                add_cell(row_index, column_index, cell_color, text, text_color)
+
+    figure = go.Figure()
+    # An invisible anchor trace: shapes alone don't establish axis ranges,
+    # so without this the plot area can size itself arbitrarily.
+    figure.add_trace(
+        go.Scatter(
+            x=[-0.5, n_columns - 0.5],
+            y=[-0.5, n_rows - 0.5],
+            mode="markers",
+            marker=dict(opacity=0),
+            showlegend=False,
+            hoverinfo="skip",
+        )
+    )
+    figure.update_layout(shapes=shapes, annotations=annotations)
+    height = 58 + 42 * n_rows
+    figure = _style_figure(figure, height=height, watermark_on_light_fill=True)
+    figure.update_xaxes(
+        tickmode="array",
+        tickvals=list(range(n_columns)),
+        ticktext=x_labels,
+        range=[-0.5, n_columns - 0.5],
+    )
+    figure.update_yaxes(
+        tickmode="array",
+        tickvals=list(range(n_rows)),
+        ticktext=row_labels,
+        range=[n_rows - 0.5, -0.5],
+    )
+    return figure
+
+
+def _render_attendance_chart(team: str, form: pd.DataFrame) -> None:
+    """One bar per match with attendance data; a gap, not a zero, where it's missing.
+
+    A true zero (COVID, behind closed doors) and a missing figure are both
+    "no visible bar" in an ordinary bar chart -- indistinguishable, which is
+    exactly the ambiguity this round's brief calls out. Zero gets a small
+    floor height plus its real "0" label so it stays visibly present; a
+    missing match gets neither -- true absence from the plot, not a data
+    point silently rendered as zero.
+    """
+    dates = [pd.Timestamp(value).date() for value in form["match_date"]]
+    x_labels = [single_date.strftime("%d.%m") for single_date in dates]
+    attendances: list[float | None] = []
+    for (_, row), match_date in zip(form.iterrows(), dates, strict=True):
+        detail = _wikipedia_match_detail(
+            team, match_date, row["goals_for"], row["goals_against"]
+        )
+        value = detail.get("attendance") if detail else None
+        attendances.append(None if value is None or pd.isna(value) else float(value))
+
+    if not any(value is not None for value in attendances):
+        return  # nothing from Wikipedia in this window -- silence, not ten empty gaps
+
+    present = [value for value in attendances if value is not None]
+    floor = max(present) * 0.03 if max(present) > 0 else 1.0
+    # Numeric column index, not the "DD.MM" string, is what goes into `x` --
+    # CONFIRMED REAL (2026-08-05, live browser): Plotly auto-detects axis
+    # type from the data, and date-shaped strings like "26.03" get silently
+    # parsed as the *number* 26.03, scrambling both bar position and
+    # chronological order (ticks rendered as "5, 10, ... 30" instead of
+    # dates). Custom tick text below relabels the numeric axis instead.
+    indexed = list(enumerate(attendances))
+    bar_x = [index for index, value in indexed if value is not None]
+    bar_y = [floor if value == 0 else value for value in present]
+    bar_text = [f"{int(value):,}".replace(",", " ") for value in present]
+
+    figure = go.Figure(
+        go.Bar(
+            x=bar_x,
+            y=bar_y,
+            text=bar_text,
+            textposition="outside",
+            marker=dict(color="#c9a227"),
+            hoverinfo="skip",
+        )
+    )
+    figure = _style_figure(figure, height=110)
+    figure.update_xaxes(
+        tickmode="array",
+        tickvals=list(range(len(x_labels))),
+        ticktext=x_labels,
+        range=[-0.5, len(x_labels) - 0.5],
+        showgrid=False,
+        zeroline=False,
+    )
+    figure.update_yaxes(showticklabels=False, showgrid=False, zeroline=False)
+    st.plotly_chart(figure, width="stretch")
+    st.caption(
+        "Frekwencja ostatnich meczów. Przerwa w słupkach = brak danych "
+        "źródłowych; słupek przy zerze = mecz naprawdę rozegrany bez publiczności."
+    )
 
 
 def _head_to_head_summary(home: str, away: str, as_of: pd.Timestamp) -> str:
@@ -1166,7 +1515,10 @@ def _render_head_to_head(home: str, away: str, as_of: pd.Timestamp) -> None:
 
 
 def _render_team_form(team: str, as_of: pd.Timestamp) -> None:
-    """Last ten results as W/R/P markers, with the full table one expander away."""
+    """Last ten matches as a metrics heat map and attendance chart.
+
+    The full match-by-match table is one expander away, unchanged.
+    """
     label = nominative_pl(team)
     form = _cached_recent_form(team, as_of.isoformat())
     st.markdown(f"**{label}**")
@@ -1174,21 +1526,25 @@ def _render_team_form(team: str, as_of: pd.Timestamp) -> None:
         st.caption("Brak meczów w zbiorze historycznym przed tą datą.")
         return
 
-    letters = [
-        _result_letter(row["goals_for"], row["goals_against"])
-        for _, row in form.iterrows()
-    ]
-    st.markdown(_form_markers_html(letters), unsafe_allow_html=True)
+    st.plotly_chart(_team_metric_heatmap_figure(form), width="stretch")
+    st.caption(
+        "Intensywność koloru rośnie wraz z wartością, osobno w każdym "
+        "wierszu — nie porównuj odcieni między wierszami ani między "
+        "drużynami. Dla „gole stracone” i „kartki” wyższa wartość oznacza "
+        "gorszy wynik drużyny."
+    )
     # A team with fewer than ten matches shows however many it really has --
     # never padded to look like a full row.
-    if len(letters) < 10:
-        matches_word = _plural_pl(len(letters), "mecz", "mecze", "meczów")
-        st.caption(f"Tylko {len(letters)} {matches_word} w historii przed tą datą.")
+    if len(form) < 10:
+        matches_word = _plural_pl(len(form), "mecz", "mecze", "meczów")
+        st.caption(f"Tylko {len(form)} {matches_word} w historii przed tą datą.")
 
     streak_sentences = _cached_current_streaks(team, as_of.isoformat())
     st.caption(
         " ".join(streak_sentences) if streak_sentences else "Brak aktualnej serii."
     )
+
+    _render_attendance_chart(team, form)
 
     with st.expander(f"Pełna forma: {label}", expanded=False):
         rows: list[dict[str, object]] = []
