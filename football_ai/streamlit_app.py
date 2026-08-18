@@ -38,6 +38,14 @@ if str(_REPO_ROOT) not in sys.path:
 
 # ruff: noqa: E402 -- imports below must follow the sys.path fix above.
 import matplotlib
+
+# Headless rendering for the PDF's matplotlib charts -- must be set before
+# `pyplot` is imported, and before Streamlit (or anything else) gets a
+# chance to pick a GUI backend that assumes a display exists.
+matplotlib.use("Agg")
+
+import matplotlib.colors
+import matplotlib.pyplot as plt
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -1061,22 +1069,15 @@ def _heatmap_figure(
     return _style_figure(figure, height=height, watermark_on_light_fill=True)
 
 
-def _score_grid_figure(
-    home_label: str,
-    away_label: str,
-    home_goals: float,
-    away_goals: float,
-    max_goals: int = 5,
-) -> tuple[go.Figure, list[tuple[str, float]], float]:
-    """Exact-scoreline probabilities as a grid, from independent Poisson sides.
+def _score_grid_matrix(
+    home_goals: float, away_goals: float, max_goals: int = 5
+) -> tuple[list[list[float]], list[tuple[str, float]], float]:
+    """The Poisson exact-scoreline matrix, shared by the on-screen chart and the PDF's.
 
-    The same distributional assumption `simulation/monte_carlo.py` already
-    simulates from, just evaluated analytically instead of sampled. Replaces
-    a single "predicted score", which reads as a confident call the model
-    never actually makes -- the grid shows how flat the real distribution is.
-
-    Also returns the three likeliest scorelines and the probability mass
-    outside the grid, so the caption can state honestly how much isn't shown.
+    Split out from `_score_grid_figure` so the PDF's matplotlib version
+    (which needs the raw probabilities, not a Plotly figure) computes from
+    the exact same numbers the screen does, rather than a second
+    independent implementation that could drift out of sync.
     """
     home_lambda = max(float(home_goals), 1e-6)
     away_lambda = max(float(away_goals), 1e-6)
@@ -1097,7 +1098,29 @@ def _score_grid_figure(
         for away_count in range(max_goals + 1)
     ]
     top_scorelines = sorted(scorelines, key=lambda item: -item[1])[:3]
+    return matrix, top_scorelines, 1.0 - inside_mass
 
+
+def _score_grid_figure(
+    home_label: str,
+    away_label: str,
+    home_goals: float,
+    away_goals: float,
+    max_goals: int = 5,
+) -> tuple[go.Figure, list[tuple[str, float]], float]:
+    """Exact-scoreline probabilities as a grid, from independent Poisson sides.
+
+    The same distributional assumption `simulation/monte_carlo.py` already
+    simulates from, just evaluated analytically instead of sampled. Replaces
+    a single "predicted score", which reads as a confident call the model
+    never actually makes -- the grid shows how flat the real distribution is.
+
+    Also returns the three likeliest scorelines and the probability mass
+    outside the grid, so the caption can state honestly how much isn't shown.
+    """
+    matrix, top_scorelines, tail_mass = _score_grid_matrix(
+        home_goals, away_goals, max_goals
+    )
     figure = _heatmap_figure(
         matrix=matrix,
         x_labels=[str(count) for count in range(max_goals + 1)],
@@ -1113,7 +1136,7 @@ def _score_grid_figure(
         yaxis_title=f"Bramki: {home_label}",
         xaxis=dict(showgrid=False, zeroline=False, side="top"),
     )
-    return figure, top_scorelines, 1.0 - inside_mass
+    return figure, top_scorelines, tail_mass
 
 
 def _poisson_pmf(expected: float, count: int) -> float:
@@ -1750,17 +1773,185 @@ def _unicode_font_path() -> Path:
     return Path(matplotlib.get_data_path()) / "fonts" / "ttf" / "DejaVuSans.ttf"
 
 
+def _matplotlib_png_bytes(figure: plt.Figure) -> bytes:
+    """Render a matplotlib figure to PNG bytes and close it, so exports don't leak."""
+    from io import BytesIO
+
+    buffer = BytesIO()
+    figure.savefig(buffer, format="png", facecolor="white", bbox_inches="tight")
+    plt.close(figure)
+    return buffer.getvalue()
+
+
+def _pdf_outcome_chart_png(
+    home_label: str, away_label: str, probabilities: dict[str, float]
+) -> bytes:
+    """1X2 probabilities as a horizontal bar chart, rendered for the PDF.
+
+    matplotlib, not the app's own Plotly figure: rasterising the
+    interactive chart would need `kaleido`, which needs a real Chrome --
+    CONFIRMED REAL (2026-08-05) this machine has none anywhere worth
+    depending on, and kaleido's own fallback (downloading one) fails here
+    on a broken system CA trust store. matplotlib is already a hard
+    dependency and needs neither, so the PDF's charts are built with it
+    directly rather than trying to reuse the screen's Plotly objects.
+    """
+    labels = [f"Wygrana {away_label}", "Remis", f"Wygrana {home_label}"]
+    values = [
+        probabilities["away_win"],
+        probabilities["draw"],
+        probabilities["home_win"],
+    ]
+    colors = [_AWAY_COLOUR, _DRAW_COLOUR, _HOME_COLOUR]
+    figure, axis = plt.subplots(figsize=(6.3, 2.1), dpi=200)
+    bars = axis.barh(labels, values, color=colors)
+    axis.set_xlim(0, 1.12)
+    axis.invert_yaxis()
+    for bar, value in zip(bars, values, strict=True):
+        axis.text(
+            value + 0.02,
+            bar.get_y() + bar.get_height() / 2,
+            f"{value:.0%}",
+            va="center",
+            fontsize=11,
+        )
+    axis.set_xticks([])
+    for spine in ("top", "right", "bottom"):
+        axis.spines[spine].set_visible(False)
+    figure.tight_layout()
+    return _matplotlib_png_bytes(figure)
+
+
+def _pdf_score_grid_png(
+    home_label: str, away_label: str, matrix: list[list[float]]
+) -> bytes:
+    """The exact-scoreline probability grid, rendered for the PDF.
+
+    Same single-hue gold family and same contrast logic as the app's own
+    heat maps (`_metric_heatmap_cell_color`/`_readable_cell_text_color`),
+    normalized against this grid's own peak cell -- consistent branding
+    and a guaranteed-readable cell text colour, not a second colour scheme
+    invented for print.
+    """
+    max_goals = len(matrix) - 1
+    peak = max((value for row in matrix for value in row), default=0.0)
+    colormap = matplotlib.colors.LinearSegmentedColormap.from_list(
+        "statsdesk_gold", [stop for _, stop in _METRIC_HEATMAP_COLORSCALE]
+    )
+    figure, axis = plt.subplots(figsize=(4.6, 4.2), dpi=200)
+    axis.imshow(matrix, cmap=colormap, vmin=0, vmax=peak or 1.0, aspect="equal")
+    for home_count in range(max_goals + 1):
+        for away_count in range(max_goals + 1):
+            value = matrix[home_count][away_count]
+            if value < 0.005:
+                continue
+            normalized = value / peak if peak > 0 else 0.0
+            cell_color = _metric_heatmap_cell_color(normalized)
+            axis.text(
+                away_count,
+                home_count,
+                f"{value:.0%}",
+                ha="center",
+                va="center",
+                fontsize=9,
+                color=_readable_cell_text_color(cell_color),
+            )
+    axis.set_xticks(range(max_goals + 1))
+    axis.set_yticks(range(max_goals + 1))
+    axis.set_xlabel(f"Bramki: {away_label}")
+    axis.set_ylabel(f"Bramki: {home_label}")
+    axis.xaxis.set_label_position("top")
+    axis.xaxis.tick_top()
+    axis.tick_params(length=0)
+    for spine in axis.spines.values():
+        spine.set_visible(False)
+    figure.tight_layout()
+    return _matplotlib_png_bytes(figure)
+
+
+def _pdf_team_comparison_png(
+    home_label: str, away_label: str, rows: list[tuple[str, float, float]]
+) -> bytes:
+    """Match-stat comparison as paired home/away bars, rendered for the PDF."""
+    categories = [label for label, _, _ in rows]
+    home_values = [home for _, home, _ in rows]
+    away_values = [away for _, _, away in rows]
+    y_positions = list(range(len(categories)))
+    bar_height = 0.35
+    peak_value = max([*home_values, *away_values], default=1.0) or 1.0
+
+    figure, axis = plt.subplots(figsize=(6.3, 0.55 * len(categories) + 1), dpi=200)
+    home_bars = axis.barh(
+        [y + bar_height / 2 for y in y_positions],
+        home_values,
+        height=bar_height,
+        color=_HOME_COLOUR,
+        label=home_label,
+    )
+    away_bars = axis.barh(
+        [y - bar_height / 2 for y in y_positions],
+        away_values,
+        height=bar_height,
+        color=_AWAY_COLOUR,
+        label=away_label,
+    )
+    for bar, value in zip(
+        list(home_bars) + list(away_bars), home_values + away_values, strict=True
+    ):
+        axis.text(
+            bar.get_width() + peak_value * 0.02,
+            bar.get_y() + bar.get_height() / 2,
+            f"{value:.1f}",
+            va="center",
+            fontsize=9,
+        )
+    axis.set_xlim(0, peak_value * 1.15)
+    axis.set_yticks(y_positions)
+    axis.set_yticklabels(categories)
+    axis.invert_yaxis()
+    axis.set_xticks([])
+    for spine in ("top", "right", "bottom"):
+        axis.spines[spine].set_visible(False)
+    # Above the plot, not inside it: CONFIRMED REAL (2026-08-06) an
+    # in-axes legend placed in any corner collided with that row's own
+    # value labels for some real prediction values (the last category's
+    # bars happened to reach into the "lower right" corner).
+    axis.legend(
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.0),
+        ncol=2,
+        frameon=False,
+        fontsize=9,
+    )
+    figure.tight_layout()
+    return _matplotlib_png_bytes(figure)
+
+
 def _build_analysis_pdf(
     home_label: str,
     away_label: str,
     match_date: date,
     tournament: str,
+    venue: str | None,
     prediction: PredictionResponse,
     facts: list[Fact],
     head_to_head_summary: str,
+    score_matrix: list[list[float]],
     top_scorelines: list[tuple[str, float]],
 ) -> bytes:
-    """One-page PDF of the analysis on screen, for sending on to an editor."""
+    """PDF of the analysis on screen, for sending on to an editor.
+
+    Match/date/venue sit at the top before anything else -- CONFIRMED REAL
+    (2026-08-06): an editor picking a fixture off a stack of these needs
+    that at a glance, not after reading past a logo. The prediction and
+    stats sections are the same charts the screen shows (rendered with
+    matplotlib rather than the app's own Plotly objects -- see
+    `_pdf_outcome_chart_png`'s docstring for why), not the numbers spelled
+    out as a sentence: a chart reads at a glance, and this format exists
+    specifically to be handed to a working desk, not read start to finish.
+    Only the head-to-head summary and the historical facts stay prose --
+    provenance-bearing claims, not something a chart can carry.
+    """
     from fpdf import FPDF
 
     class _BrandedPDF(FPDF):
@@ -1795,6 +1986,15 @@ def _build_analysis_pdf(
         # zero space left and raises "Not enough horizontal space".
         document.multi_cell(0, gap, text, new_x="LMARGIN", new_y="NEXT")
 
+    usable_width = document.w - document.l_margin - document.r_margin
+
+    def embed_chart(png_bytes: bytes, width: float, gap: float = 3) -> None:
+        """Place a chart image at the left margin, then advance past it."""
+        from io import BytesIO
+
+        document.image(BytesIO(png_bytes), x=document.l_margin, w=width)
+        document.ln(gap)
+
     if _LOCKUP_LIGHT.exists():
         # The PDF page is white, so this is the `_light` variant -- the dark
         # one would be near-invisible on it.
@@ -1802,52 +2002,77 @@ def _build_analysis_pdf(
         document.set_y(28)
     else:
         write(_APP_NAME, size=9, style="B", gap=5)
-    write(f"{home_label} — {away_label}", size=17, style="B", gap=9)
-    write(f"{match_date} · {tournament}", size=9)
-    document.ln(2)
+    write(f"{home_label} — {away_label}", size=19, style="B", gap=10)
+    write(f"{match_date}", size=11, style="B", gap=6)
+    if venue:
+        write(venue, size=10, gap=5.5)
+    write(tournament, size=9, gap=5)
+    document.ln(3)
 
     outcome = prediction.outcome_probabilities
-    write("Prognoza", size=12, style="B", gap=7)
-    write(
-        f"Wygrana {home_label}: {outcome.home_win:.0%}    "
-        f"Remis: {outcome.draw:.0%}    "
-        f"Wygrana {away_label}: {outcome.away_win:.0%}"
+    write("Prognoza wyniku", size=12, style="B", gap=7)
+    embed_chart(
+        _pdf_outcome_chart_png(
+            home_label, away_label, outcome.model_dump()
+        ),
+        width=usable_width,
     )
     write(
         f"Oczekiwane bramki (xG): {prediction.xg['home']:.2f} — "
         f"{prediction.xg['away']:.2f}    "
         f"Obie drużyny strzelą: {prediction.btts:.0%}    "
-        f"Powyżej 2.5: {prediction.over_under['over_2_5']:.0%}"
+        f"Powyżej 2.5: {prediction.over_under['over_2_5']:.0%}",
+        size=9,
+    )
+    document.ln(3)
+
+    write("Prawdopodobieństwo dokładnego wyniku", size=12, style="B", gap=7)
+    embed_chart(
+        _pdf_score_grid_png(home_label, away_label, score_matrix),
+        width=min(usable_width, 100),
     )
     if top_scorelines:
         likeliest = "    ".join(
             f"{score} ({value:.0%})" for score, value in top_scorelines
         )
-        write(f"Najbardziej prawdopodobne wyniki: {likeliest}")
-    document.ln(2)
+        write(f"Najbardziej prawdopodobne: {likeliest}", size=9)
+    document.ln(3)
 
     write("Bilans bezpośredni", size=12, style="B", gap=7)
     write(head_to_head_summary)
-    document.ln(2)
+    document.ln(3)
 
     write("Statystyki meczowe (prognoza)", size=12, style="B", gap=7)
-    for label, home_value, away_value in (
-        ("Rzuty rożne", prediction.corners["home"], prediction.corners["away"]),
-        ("Żółte kartki", prediction.cards["home"], prediction.cards["away"]),
-        ("Strzały", prediction.shots["home"], prediction.shots["away"]),
-        (
-            "Strzały celne",
-            prediction.shots_on_target["home"],
-            prediction.shots_on_target["away"],
+    embed_chart(
+        _pdf_team_comparison_png(
+            home_label,
+            away_label,
+            [
+                (
+                    "Rzuty rożne",
+                    prediction.corners["home"],
+                    prediction.corners["away"],
+                ),
+                (
+                    "Żółte kartki",
+                    prediction.cards["home"],
+                    prediction.cards["away"],
+                ),
+                ("Strzały", prediction.shots["home"], prediction.shots["away"]),
+                (
+                    "Strzały celne",
+                    prediction.shots_on_target["home"],
+                    prediction.shots_on_target["away"],
+                ),
+                (
+                    "Posiadanie (%)",
+                    prediction.possession["home"],
+                    prediction.possession["away"],
+                ),
+            ],
         ),
-        (
-            "Posiadanie (%)",
-            prediction.possession["home"],
-            prediction.possession["away"],
-        ),
-    ):
-        write(f"{label}: {home_value:.1f} — {away_value:.1f}")
-    document.ln(2)
+        width=usable_width,
+    )
 
     write("Nietypowe fakty", size=12, style="B", gap=7)
     if facts:
@@ -1935,7 +2160,9 @@ def _clear_fixture() -> None:
     st.session_state.pop("selected_fixture", None)
 
 
-def _select_fixture(home: str, away: str, match_date: date, tournament: str) -> None:
+def _select_fixture(
+    home: str, away: str, match_date: date, tournament: str, venue: str | None = None
+) -> None:
     """Move to the analysis screen for one fixture.
 
     Used as an `on_click` callback, never called inline: a callback runs
@@ -1943,8 +2170,28 @@ def _select_fixture(home: str, away: str, match_date: date, tournament: str) -> 
     next pass without an explicit `st.rerun()`. That matters because
     `st.rerun()` resets `st.tabs` to the first tab -- clicking a match in the
     "Po meczu" tab used to bounce the user back to "Nadchodzące mecze".
+
+    `venue` defaults to `None`: the manual-pair picker has no fixture row to
+    read it from (it's a hypothetical matchup), so the PDF header simply
+    omits that line rather than showing a placeholder.
     """
-    st.session_state["selected_fixture"] = (home, away, match_date, tournament)
+    st.session_state["selected_fixture"] = (home, away, match_date, tournament, venue)
+
+
+def _fixture_venue(row: pd.Series) -> str | None:
+    """The venue text a fixture row carries, whichever column name the source used.
+
+    CONFIRMED REAL (2026-08-06): checking `not venue` to decide whether to
+    fall back to `stadium_name` never falls back, because `not float("nan")`
+    is `False` -- NaN is truthy under plain Python truthiness, so a row
+    with `stadium=NaN` and a real `stadium_name` (e.g. Thailand-Singapore,
+    `stadium_name="Rajamangala Stadium"`) silently returned no venue at
+    all. Needs `pd.isna()`, not truthiness, to tell "empty" from "NaN".
+    """
+    venue = row.get("stadium") if "stadium" in row.index else None
+    if (venue is None or pd.isna(venue)) and "stadium_name" in row.index:
+        venue = row.get("stadium_name")
+    return str(venue) if venue is not None and not pd.isna(venue) else None
 
 
 def _fixture_left_label(row: pd.Series) -> str:
@@ -1957,10 +2204,7 @@ def _fixture_left_label(row: pd.Series) -> str:
     timestamp = pd.Timestamp(row["match_date"])
     if timestamp.hour or timestamp.minute:
         return timestamp.strftime("%H:%M")
-    venue = row.get("stadium") if "stadium" in row.index else None
-    if not venue and "stadium_name" in row.index:
-        venue = row.get("stadium_name")
-    return str(venue) if venue and not pd.isna(venue) else "—"
+    return _fixture_venue(row) or "—"
 
 
 def _render_fixture_card(
@@ -1990,7 +2234,13 @@ def _render_fixture_card(
                 key=key,
                 width="stretch",
                 on_click=_select_fixture,
-                args=(home, away, pd.Timestamp(row["match_date"]).date(), tournament),
+                args=(
+                    home,
+                    away,
+                    pd.Timestamp(row["match_date"]).date(),
+                    tournament,
+                    _fixture_venue(row),
+                ),
             )
 
 
@@ -2155,7 +2405,7 @@ def _render_match_preview_tab() -> None:
     if st.session_state.get("selected_fixture") is None:
         return
 
-    home, away, match_date, tournament = stored
+    home, away, match_date, tournament, venue = stored
 
     with st.spinner("Liczę predykcję..."):
         prediction = _cached_prediction(home, away, match_date, tournament)
@@ -2167,7 +2417,8 @@ def _render_match_preview_tab() -> None:
     away_label = nominative_pl(away)
 
     st.header(f"{home_label} — {away_label}")
-    st.caption(f"{match_date} · {tournament}")
+    caption = f"{match_date} · {tournament}"
+    st.caption(f"{caption} · {venue}" if venue else caption)
     _render_match_officials(home, away, match_date)
 
     _warn_on_missing_elo(home, away)
@@ -2852,7 +3103,7 @@ def _render_header() -> None:
 
 
 def _render_pdf_export() -> None:
-    """Offer the analysis currently on screen as a one-page PDF.
+    """Offer the analysis currently on screen as an editorial-ready PDF.
 
     Rebuilt from `selected_fixture` rather than from a payload stashed by the
     analysis screen: the header renders *before* the tabs do, so a stashed
@@ -2863,7 +3114,7 @@ def _render_pdf_export() -> None:
     stored = st.session_state.get("selected_fixture")
     if stored is None:
         return
-    home, away, match_date, tournament = stored
+    home, away, match_date, tournament, venue = stored
     try:
         prediction = _cached_prediction(home, away, match_date, tournament)
         as_of = pd.Timestamp(match_date, tz="UTC")
@@ -2874,17 +3125,19 @@ def _render_pdf_export() -> None:
         ]
         home_label = nominative_pl(home)
         away_label = nominative_pl(away)
-        _, top_scorelines, _ = _score_grid_figure(
-            home_label, away_label, prediction.goals["home"], prediction.goals["away"]
+        score_matrix, top_scorelines, _ = _score_grid_matrix(
+            prediction.goals["home"], prediction.goals["away"]
         )
         pdf_bytes = _build_analysis_pdf(
             home_label=home_label,
             away_label=away_label,
             match_date=match_date,
             tournament=tournament,
+            venue=venue,
             prediction=prediction,
             facts=facts,
             head_to_head_summary=_head_to_head_summary(home, away, as_of),
+            score_matrix=score_matrix,
             top_scorelines=top_scorelines,
         )
     except Exception:
