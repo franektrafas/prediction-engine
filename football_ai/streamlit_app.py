@@ -1570,32 +1570,46 @@ def _render_team_form(team: str, as_of: pd.Timestamp) -> None:
     _render_attendance_chart(team, form)
 
     with st.expander(f"Pełna forma: {label}", expanded=False):
-        rows: list[dict[str, object]] = []
-        for _, row in form.iloc[::-1].iterrows():
-            entry: dict[str, object] = {
-                "Data": pd.Timestamp(row["match_date"]).date(),
-                "Przeciwnik": nominative_pl(str(row["opponent"])),
-                "Wynik": f"{int(row['goals_for'])}:{int(row['goals_against'])}",
-                "Gdzie": "dom" if bool(row["is_home"]) else "wyjazd",
-            }
-            detail = _wikipedia_match_detail(
-                team,
-                pd.Timestamp(row["match_date"]).date(),
-                row["goals_for"],
-                row["goals_against"],
-            )
-            if detail is not None:
-                attendance = detail.get("attendance")
-                if attendance is not None and not pd.isna(attendance):
-                    entry["Frekwencja"] = int(attendance)
-                referee = detail.get("referee")
-                if referee is not None and not pd.isna(referee):
-                    entry["Sędzia"] = str(referee)
-            rows.append(entry)
         # Columns appear only where the source actually has them: a team
         # whose page Wikipedia doesn't carry gets the original four columns,
         # not two empty ones implying we lost the data.
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        st.dataframe(
+            pd.DataFrame(_team_form_table_rows(team, form)),
+            width="stretch",
+            hide_index=True,
+        )
+
+
+def _team_form_table_rows(team: str, form: pd.DataFrame) -> list[dict[str, object]]:
+    """One row per match, newest first -- shared by the on-screen expander and the PDF.
+
+    "Frekwencja"/"Sędzia" are added per row only when Wikipedia actually has
+    them for that exact match, so the two tables degrade identically: a
+    team with no Wikipedia coverage at all just never gets those columns.
+    """
+    rows: list[dict[str, object]] = []
+    for _, row in form.iloc[::-1].iterrows():
+        entry: dict[str, object] = {
+            "Data": pd.Timestamp(row["match_date"]).date(),
+            "Przeciwnik": nominative_pl(str(row["opponent"])),
+            "Wynik": f"{int(row['goals_for'])}:{int(row['goals_against'])}",
+            "Gdzie": "dom" if bool(row["is_home"]) else "wyjazd",
+        }
+        detail = _wikipedia_match_detail(
+            team,
+            pd.Timestamp(row["match_date"]).date(),
+            row["goals_for"],
+            row["goals_against"],
+        )
+        if detail is not None:
+            attendance = detail.get("attendance")
+            if attendance is not None and not pd.isna(attendance):
+                entry["Frekwencja"] = int(attendance)
+            referee = detail.get("referee")
+            if referee is not None and not pd.isna(referee):
+                entry["Sędzia"] = str(referee)
+        rows.append(entry)
+    return rows
 
 
 def _render_match_officials(home: str, away: str, match_date: date) -> None:
@@ -1938,6 +1952,8 @@ def _build_analysis_pdf(
     head_to_head_summary: str,
     score_matrix: list[list[float]],
     top_scorelines: list[tuple[str, float]],
+    home_form_rows: list[dict[str, object]],
+    away_form_rows: list[dict[str, object]],
 ) -> bytes:
     """PDF of the analysis on screen, for sending on to an editor.
 
@@ -1950,9 +1966,13 @@ def _build_analysis_pdf(
     out as a sentence: a chart reads at a glance, and this format exists
     specifically to be handed to a working desk, not read start to finish.
     Only the head-to-head summary and the historical facts stay prose --
-    provenance-bearing claims, not something a chart can carry.
+    provenance-bearing claims, not something a chart can carry. The two
+    recent-form tables are the exact same rows as the on-screen "Pełna
+    forma" expander (`_team_form_table_rows`), including the same
+    per-match Frekwencja/Sędzia columns when Wikipedia has them.
     """
     from fpdf import FPDF
+    from fpdf.fonts import FontFace
 
     class _BrandedPDF(FPDF):
         """A4 document that stamps the StatsDesk watermark on every page.
@@ -1994,6 +2014,31 @@ def _build_analysis_pdf(
 
         document.image(BytesIO(png_bytes), x=document.l_margin, w=width)
         document.ln(gap)
+
+    def render_form_table(team_label: str, rows: list[dict[str, object]]) -> None:
+        """The exact rows the "Pełna forma" expander shows, as a real PDF table.
+
+        Skips entirely for a team with no matches on record before this
+        date, rather than a heading over an empty table.
+        """
+        if not rows:
+            return
+        write(f"Forma: {team_label}", size=11, style="B", gap=6)
+        frame = pd.DataFrame(rows)
+        table_rows = [list(frame.columns)] + [
+            ["" if pd.isna(value) else str(value) for value in record]
+            for record in frame.itertuples(index=False)
+        ]
+        document.set_font("DejaVu", "", 8)
+        with document.table(
+            table_rows,
+            text_align="LEFT",
+            first_row_as_headings=True,
+            headings_style=FontFace(family="DejaVu", emphasis="B", size_pt=8),
+            line_height=5,
+        ):
+            pass
+        document.ln(3)
 
     if _LOCKUP_LIGHT.exists():
         # The PDF page is white, so this is the `_light` variant -- the dark
@@ -2041,6 +2086,9 @@ def _build_analysis_pdf(
     write("Bilans bezpośredni", size=12, style="B", gap=7)
     write(head_to_head_summary)
     document.ln(3)
+
+    render_form_table(home_label, home_form_rows)
+    render_form_table(away_label, away_form_rows)
 
     write("Statystyki meczowe (prognoza)", size=12, style="B", gap=7)
     embed_chart(
@@ -3139,6 +3187,12 @@ def _render_pdf_export() -> None:
             head_to_head_summary=_head_to_head_summary(home, away, as_of),
             score_matrix=score_matrix,
             top_scorelines=top_scorelines,
+            home_form_rows=_team_form_table_rows(
+                home, _cached_recent_form(home, as_of.isoformat())
+            ),
+            away_form_rows=_team_form_table_rows(
+                away, _cached_recent_form(away, as_of.isoformat())
+            ),
         )
     except Exception:
         st.caption("PDF niedostępny")
