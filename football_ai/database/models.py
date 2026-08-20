@@ -79,6 +79,11 @@ class Match(Base):
     competition_name: Mapped[str | None] = mapped_column(String(120))
     season_name: Mapped[str | None] = mapped_column(String(64))
     tournament: Mapped[str | None] = mapped_column(String(120), index=True)
+    # Round/phase within the tournament ("Group Stage", "Quarter-final", ...).
+    # Nullable and unpopulated by martj42 (our current results source doesn't
+    # carry this) -- a landing column for sources that do, per the project's
+    # "warstwowa jakość danych" rule: not every field needs every source.
+    stage: Mapped[str | None] = mapped_column(String(64))
     status: Mapped[str | None] = mapped_column(String(32), default="finished")
     match_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     stadium_name: Mapped[str | None] = mapped_column(String(120))
@@ -93,6 +98,63 @@ class Match(Base):
     away_team_id: Mapped[int] = mapped_column(ForeignKey("teams.id"), index=True)
     home_score: Mapped[int | None] = mapped_column(Integer)
     away_score: Mapped[int | None] = mapped_column(Integer)
+    # Nullable, not a default-False flag: for most historical rows we simply
+    # don't know whether a match went to extra time, and asserting False
+    # would be a fabricated fact, not an absence of one.
+    extra_time: Mapped[bool | None] = mapped_column(Boolean)
+    # Unlike extra_time, this one has a real source: martj42's shootouts.csv
+    # is matched by (date, home_team, away_team) in `international_results.py`
+    # -- a match absent from it structurally almost always means no shootout
+    # happened (group-stage/friendly matches can't go to penalties at all),
+    # so False is a safe default here, not a guess.
+    penalty_shootout: Mapped[bool] = mapped_column(Boolean, default=False)
+    penalty_shootout_winner_team_id: Mapped[int | None] = mapped_column(
+        ForeignKey("teams.id")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class MatchEvent(Base):
+    """A single in-match event (goal, card, substitution, ...).
+
+    Currently only populated for goal-type events (`goal`/`own_goal`/
+    `penalty`), sourced from martj42's goalscorers.csv via
+    `international_results.py`'s `normalize_goalscorers` -- the other event
+    types in the check constraint below are real canonical-model fields with
+    no populating source yet, not aspirational bloat: they're named
+    explicitly in the project's Data Engine plan so future sources (event
+    feeds, live lineups) land in the same table without a schema change.
+    """
+
+    __tablename__ = "match_events"
+
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('goal', 'own_goal', 'penalty', 'missed_penalty', "
+            "'yellow_card', 'second_yellow', 'red_card', 'substitution', "
+            "'var_event')",
+            name="ck_match_events_event_type",
+        ),
+        Index("ix_match_events_match_type", "match_id", "event_type"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    match_id: Mapped[int] = mapped_column(ForeignKey("matches.id"), index=True)
+    team_id: Mapped[int | None] = mapped_column(ForeignKey("teams.id"), index=True)
+    event_type: Mapped[str] = mapped_column(String(32), index=True)
+    minute: Mapped[int | None] = mapped_column(Integer)
+    added_time: Mapped[int | None] = mapped_column(Integer)
+    # Raw source string, not a Player FK -- same reasoning as
+    # `international_results.py`'s `normalize_goalscorers`: this project has
+    # no player-name-alias infrastructure (unlike `config.team_aliases` for
+    # teams), and scorer spelling has been observed consistent within a
+    # single source.
+    player_name: Mapped[str | None] = mapped_column(String(120))
+    assist_player_name: Mapped[str | None] = mapped_column(String(120))
+    related_player_name: Mapped[str | None] = mapped_column(String(120))
+    event_source: Mapped[str] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -187,6 +249,63 @@ class PlayerStatistic(Base):
     saves: Mapped[int | None] = mapped_column(Integer)
     yellow_cards: Mapped[int | None] = mapped_column(Integer)
     red_cards: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class MatchStatisticSource(Base):
+    """Data Provenance Layer: which source supplied a statistic's value, and its status.
+
+    One row per (match, statistic, source, fetch) -- deliberately NOT a
+    single canonical value per (match, statistic). When two sources disagree
+    on the same statistic for the same match, both rows are kept (per the
+    project's "Source Priority i konflikty" rule: never drop a source,
+    resolve the canonical value by priority and record the disagreement) --
+    resolving the canonical value is a query-time concern (highest
+    `confidence`/`license_status` wins), not something enforced by this
+    table's shape.
+
+    `license_status`/`confidence` reuse the exact vocabulary from the
+    project's own Data Engine source audit (VERIFIED/RESEARCH_ONLY/UNKNOWN;
+    HIGH/MEDIUM_HIGH/LOW/UNKNOWN) so a row here means the same thing it
+    means in that audit, not a parallel taxonomy.
+    """
+
+    __tablename__ = "match_sources"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "match_id",
+            "statistic_name",
+            "source",
+            "retrieved_at",
+            name="uq_match_sources_match_stat_source_retrieved",
+        ),
+        CheckConstraint(
+            "license_status IN ('VERIFIED', 'RESEARCH_ONLY', 'UNKNOWN')",
+            name="ck_match_sources_license_status",
+        ),
+        CheckConstraint(
+            "confidence IN ('HIGH', 'MEDIUM_HIGH', 'LOW', 'UNKNOWN')",
+            name="ck_match_sources_confidence",
+        ),
+        Index("ix_match_sources_match_stat", "match_id", "statistic_name"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    match_id: Mapped[int] = mapped_column(ForeignKey("matches.id"), index=True)
+    statistic_name: Mapped[str] = mapped_column(String(64), index=True)
+    home_value: Mapped[float | None] = mapped_column(Float)
+    away_value: Mapped[float | None] = mapped_column(Float)
+    source: Mapped[str] = mapped_column(String(64), index=True)
+    source_url: Mapped[str | None] = mapped_column(String(255))
+    source_dataset: Mapped[str | None] = mapped_column(String(120))
+    source_license: Mapped[str] = mapped_column(String(64))
+    license_status: Mapped[str] = mapped_column(String(16))
+    retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    data_version: Mapped[str | None] = mapped_column(String(32))
+    confidence: Mapped[str] = mapped_column(String(16))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

@@ -25,6 +25,11 @@ _GOALSCORERS_CSV = """date,home_team,away_team,team,scorer,minute,own_goal,penal
 1899-01-01,Nowhereland,Somewhereland,Nowhereland,Nobody,10.0,False,False
 """
 
+# Real result: Italy beat France on penalties in the 2006 World Cup Final.
+_SHOOTOUTS_CSV = """date,home_team,away_team,winner,first_shooter
+2006-07-09,Italy,France,Italy,
+"""
+
 
 class InternationalResultsSourceTestCase(unittest.TestCase):
     """Validate fetch/normalize/merge behavior, fully offline."""
@@ -61,6 +66,18 @@ class InternationalResultsSourceTestCase(unittest.TestCase):
         # merge/feature-build time, not something normalize_results should collapse early.
         self.assertIn("German DR", normalized["home_team_name"].to_list())
         self.assertIn("Germany", normalized["home_team_name"].to_list())
+
+    def test_normalize_shootouts_maps_onto_canonical_columns(self) -> None:
+        """Real fact: Italy beat France on penalties in the 2006 World Cup Final."""
+        raw = pd.read_csv(pd.io.common.StringIO(_SHOOTOUTS_CSV))
+        normalized = self.source.normalize_shootouts(raw)
+        self.assertListEqual(
+            list(normalized.columns),
+            ["match_date", "home_team_name", "away_team_name", "winner_team_name"],
+        )
+        self.assertEqual(len(normalized), 1)
+        self.assertEqual(normalized["winner_team_name"].iloc[0], "Italy")
+        self.assertTrue(pd.api.types.is_datetime64_any_dtype(normalized["match_date"]))
 
     def test_build_records_frame_uses_martj42_for_identity_and_supplemental_for_elo(self) -> None:
         """martj42 wins identity/score; the existing Elo file only fills in Elo columns, per plan."""

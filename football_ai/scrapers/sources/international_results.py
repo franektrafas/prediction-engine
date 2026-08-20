@@ -168,6 +168,25 @@ class InternationalResultsSource(BaseDataSource):
         matched["match_id"] = matched["match_id"].astype("int64")
         return matched.sort_values("match_date").reset_index(drop=True)
 
+    def normalize_shootouts(self, raw: pd.DataFrame) -> pd.DataFrame:
+        """Map martj42's shootouts.csv onto canonical column names.
+
+        Real columns are just `date/home_team/away_team/winner/
+        first_shooter` -- no shared numeric id with `results.csv`, so unlike
+        `normalize_goalscorers` this can't join on `match_id`; callers match
+        on (home_team_name, away_team_name, match_date) instead (see
+        `database.loaders.load_penalty_shootouts`). `first_shooter` isn't
+        kept -- nothing in the canonical model has a field for it yet.
+        """
+        return pd.DataFrame(
+            {
+                "match_date": pd.to_datetime(raw["date"], utc=True),
+                "home_team_name": raw["home_team"].map(canonicalize_team_name),
+                "away_team_name": raw["away_team"].map(canonicalize_team_name),
+                "winner_team_name": raw["winner"].map(canonicalize_team_name),
+            }
+        )
+
     def build_records_frame(
         self,
         elo_source_path: str | Path | None = None,

@@ -41,6 +41,10 @@ CREATE TABLE IF NOT EXISTS matches (
     competition_name VARCHAR(120),
     season_name VARCHAR(64),
     tournament VARCHAR(120),
+    -- Round/phase within the tournament. Nullable and unpopulated by martj42
+    -- (our current results source doesn't carry this) -- a landing column
+    -- for sources that do.
+    stage VARCHAR(64),
     status VARCHAR(32),
     match_date TIMESTAMPTZ NOT NULL,
     stadium_name VARCHAR(120),
@@ -55,6 +59,14 @@ CREATE TABLE IF NOT EXISTS matches (
     away_team_id BIGINT NOT NULL REFERENCES teams(id),
     home_score INTEGER,
     away_score INTEGER,
+    -- Nullable, not default-FALSE: for most historical rows we don't know
+    -- whether the match went to extra time, and FALSE would fabricate a fact.
+    extra_time BOOLEAN,
+    -- Unlike extra_time, this has a real source (martj42's shootouts.csv,
+    -- matched in international_results.py) -- FALSE is a safe default since
+    -- most matches structurally can't go to penalties at all.
+    penalty_shootout BOOLEAN NOT NULL DEFAULT FALSE,
+    penalty_shootout_winner_team_id BIGINT REFERENCES teams(id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_matches_source_external_id UNIQUE (source, external_id)
 );
@@ -63,6 +75,34 @@ CREATE INDEX IF NOT EXISTS ix_matches_date ON matches (match_date);
 CREATE INDEX IF NOT EXISTS ix_matches_date_teams
     ON matches (match_date, home_team_id, away_team_id);
 CREATE INDEX IF NOT EXISTS ix_matches_competition_type ON matches (competition_type);
+
+-- Currently only populated for goal-type events (goal/own_goal/penalty),
+-- sourced from martj42's goalscorers.csv. The other event types below are
+-- real canonical-model fields named in the project's Data Engine plan with
+-- no populating source yet, so future sources land here without a schema
+-- change -- not aspirational bloat.
+CREATE TABLE IF NOT EXISTS match_events (
+    id BIGSERIAL PRIMARY KEY,
+    match_id BIGINT NOT NULL REFERENCES matches(id),
+    team_id BIGINT REFERENCES teams(id),
+    event_type VARCHAR(32) NOT NULL
+        CONSTRAINT ck_match_events_event_type CHECK (event_type IN (
+            'goal', 'own_goal', 'penalty', 'missed_penalty', 'yellow_card',
+            'second_yellow', 'red_card', 'substitution', 'var_event'
+        )),
+    minute INTEGER,
+    added_time INTEGER,
+    -- Raw source string, not a players FK -- same reasoning as
+    -- international_results.py's normalize_goalscorers: no player-name-alias
+    -- infrastructure exists yet (unlike config.team_aliases for teams).
+    player_name VARCHAR(120),
+    assist_player_name VARCHAR(120),
+    related_player_name VARCHAR(120),
+    event_source VARCHAR(32) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS ix_match_events_match_type ON match_events (match_id, event_type);
 
 CREATE TABLE IF NOT EXISTS lineups (
     id BIGSERIAL PRIMARY KEY,
@@ -130,6 +170,38 @@ CREATE TABLE IF NOT EXISTS player_statistics (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_player_statistics_match_player UNIQUE (match_id, team_id, player_id)
 );
+
+-- Data Provenance Layer: one row per (match, statistic, source, fetch) --
+-- deliberately not a single canonical value per (match, statistic). When two
+-- sources disagree, both rows are kept (never drop a source); resolving the
+-- canonical value by Source Priority is a query-time concern, not enforced
+-- by this table's shape. license_status/confidence reuse the exact
+-- vocabulary from the project's own Data Engine source audit.
+CREATE TABLE IF NOT EXISTS match_sources (
+    id BIGSERIAL PRIMARY KEY,
+    match_id BIGINT NOT NULL REFERENCES matches(id),
+    statistic_name VARCHAR(64) NOT NULL,
+    home_value DOUBLE PRECISION,
+    away_value DOUBLE PRECISION,
+    source VARCHAR(64) NOT NULL,
+    source_url VARCHAR(255),
+    source_dataset VARCHAR(120),
+    source_license VARCHAR(64) NOT NULL,
+    license_status VARCHAR(16) NOT NULL
+        CONSTRAINT ck_match_sources_license_status
+        CHECK (license_status IN ('VERIFIED', 'RESEARCH_ONLY', 'UNKNOWN')),
+    retrieved_at TIMESTAMPTZ NOT NULL,
+    data_version VARCHAR(32),
+    confidence VARCHAR(16) NOT NULL
+        CONSTRAINT ck_match_sources_confidence
+        CHECK (confidence IN ('HIGH', 'MEDIUM_HIGH', 'LOW', 'UNKNOWN')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_match_sources_match_stat_source_retrieved
+        UNIQUE (match_id, statistic_name, source, retrieved_at)
+);
+
+CREATE INDEX IF NOT EXISTS ix_match_sources_match_stat
+    ON match_sources (match_id, statistic_name);
 
 CREATE TABLE IF NOT EXISTS elo_ratings (
     id BIGSERIAL PRIMARY KEY,
