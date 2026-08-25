@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.footballai.datarefresh</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/franektrafas/Documents/Codex/2026-07-01/jeste-seniorem-machine-learning-engineer-data/.venv312/bin/python</string>
+        <string>-m</string>
+        <string>football_ai.scrapers.refresh_all</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/franektrafas/Documents/Codex/2026-07-01/jeste-seniorem-machine-learning-engineer-data</string>
+
+    <!-- Once daily at 06:00 local time. To run more often during a live
+         tournament, either add more <dict> entries to this array (one per
+         time of day), or replace StartCalendarInterval with
+         StartInterval (seconds) for a fixed-cadence schedule instead --
+         no changes needed anywhere else. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/franektrafas/Documents/Codex/2026-07-01/jeste-seniorem-machine-learning-engineer-data/football_ai/data/processed/refresh_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/franektrafas/Documents/Codex/2026-07-01/jeste-seniorem-machine-learning-engineer-data/football_ai/data/processed/refresh_stderr.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

@@ -144,7 +144,18 @@ class WorldFootballEloSource(BaseDataSource):
         return dict(zip(snapshot["team_name"], snapshot["rating"].astype(float)))
 
     def ingest_snapshot_to_database(self, session: Session, snapshot: pd.DataFrame) -> None:
-        """Persist a normalized Elo snapshot to the database."""
+        """Persist a normalized Elo snapshot to the database.
+
+        Upserts on `(team_id, rating_date, source)` -- CONFIRMED REAL
+        (2026-08-25, first real `launchd`-triggered run): a plain INSERT
+        here raised `UniqueViolation` on `uq_elo_team_date_source` the
+        moment this ran twice on the same calendar day (a manual test run
+        earlier the same day, then the scheduled run), aborting the whole
+        batch on the very first team. Re-running the same day is a normal
+        case (a manual `launchctl start` test, a retry after a transient
+        DB failure), not an edge case -- updating the existing row in place
+        keeps that idempotent instead of only working once per day.
+        """
         for row in snapshot.to_dict(orient="records"):
             team = session.query(Team).filter(Team.name == row["team_name"]).one_or_none()
             if team is None:
@@ -152,15 +163,29 @@ class WorldFootballEloSource(BaseDataSource):
                 session.add(team)
                 session.flush()
             team.current_elo = row["rating"]
-            session.add(
-                EloRating(
-                    team_id=team.id,
-                    rating_date=row["rating_date"],
-                    rating=float(row["rating"]),
-                    rank=int(row["rank"]) if pd.notna(row.get("rank")) else None,
-                    source="world_football_elo",
+            existing = (
+                session.query(EloRating)
+                .filter(
+                    EloRating.team_id == team.id,
+                    EloRating.rating_date == row["rating_date"],
+                    EloRating.source == "world_football_elo",
                 )
+                .one_or_none()
             )
+            new_rank = int(row["rank"]) if pd.notna(row.get("rank")) else None
+            if existing is not None:
+                existing.rating = float(row["rating"])
+                existing.rank = new_rank
+            else:
+                session.add(
+                    EloRating(
+                        team_id=team.id,
+                        rating_date=row["rating_date"],
+                        rating=float(row["rating"]),
+                        rank=new_rank,
+                        source="world_football_elo",
+                    )
+                )
         session.commit()
 
 
