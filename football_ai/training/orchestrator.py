@@ -470,12 +470,18 @@ def train_target(
     return results
 
 
+_DEFAULT_SQUAD_SUMMARY_PATH = Path(
+    "football_ai/data/processed/tournament_squads_summary.parquet"
+)
+
+
 def run_training(
     matches_path: str | Path,
     version: str = "v1",
     n_trials: int = 20,
     target_names: list[str] | None = None,
     optuna_storage_path: str | Path | None = None,
+    squad_summary_path: str | Path | None = _DEFAULT_SQUAD_SUMMARY_PATH,
 ) -> list[TrainingResult]:
     """Load a matches file, build features, and train every requested target.
 
@@ -483,6 +489,13 @@ def run_training(
     historical-results file has no `home_xg`/`home_corners`/etc.) is skipped
     with a log message instead of letting `build_training_dataset` raise a
     `KeyError`, since minimal datasets legitimately won't cover every target.
+
+    `squad_summary_path` feeds `build_features`'s squad age/height/
+    continuity/cohesion indices (see `features.builder.merge_squad_indices`)
+    -- defaults to the canonical processed path so a plain training run
+    picks it up without an extra flag, but is silently skipped (not an
+    error) when the file doesn't exist, e.g. in a minimal test fixture
+    environment. Pass `None` explicitly to opt out even when the file exists.
     """
     requested_targets = target_names or list(TARGET_TASK_MAPPING)
     unknown_targets = [name for name in requested_targets if name not in TARGET_TASK_MAPPING]
@@ -499,7 +512,11 @@ def run_training(
     score_columns = [c for c in ("home_score", "away_score") if c in cleaned_matches.columns]
     if score_columns:
         cleaned_matches = cleaned_matches.dropna(subset=score_columns)
-    feature_result = build_features(cleaned_matches)
+
+    squad_summary = None
+    if squad_summary_path is not None and Path(squad_summary_path).exists():
+        squad_summary = read_table(squad_summary_path)
+    feature_result = build_features(cleaned_matches, squad_summary=squad_summary)
 
     results: list[TrainingResult] = []
     for target_name in requested_targets:
@@ -554,6 +571,16 @@ if __name__ == "__main__":
             "disable persistence and use an in-memory (non-resumable) study."
         ),
     )
+    parser.add_argument(
+        "--squad-summary-path",
+        default=str(_DEFAULT_SQUAD_SUMMARY_PATH),
+        help=(
+            "Path to footballsquads' tournament_squads_summary.parquet, merged "
+            "in as squad age/height/continuity/cohesion features. Defaults to "
+            "the canonical processed path (skipped, not an error, if missing); "
+            "pass an empty string to opt out even when that file exists."
+        ),
+    )
     arguments = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -573,5 +600,6 @@ if __name__ == "__main__":
         n_trials=arguments.n_trials,
         target_names=resolved_targets,
         optuna_storage_path=resolved_optuna_storage,
+        squad_summary_path=arguments.squad_summary_path or None,
     )
     print(f"Trained and registered {len(training_results)} model artifacts.")

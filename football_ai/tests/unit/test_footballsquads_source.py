@@ -9,13 +9,16 @@ import pandas as pd
 
 from football_ai.scrapers.sources.footballsquads import (
     FootballSquadsSource,
+    _club_cohesion_index,
     _continuity_ratio,
+    _normalize_club_name,
     _parse_birth_date,
     _parse_height_meters,
     _parse_squad_text,
     _position_bucket,
     _squad_summary,
     _tournament_start_date,
+    summarize_squads,
 )
 
 # Real excerpts (trimmed to 3 players) fetched 2026-08-20 from
@@ -253,6 +256,128 @@ class FootballSquadsSourceTestCase(unittest.TestCase):
         self.assertIn("national/worldcup/wc2022/poland.txt", paths)
         self.assertIn("national/eurocham/euro2024/germany.txt", paths)
         self.assertEqual(len(refs), 2)
+
+
+class SummarizeSquadsTestCase(unittest.TestCase):
+    """The offline re-aggregation path build_squads() now delegates to."""
+
+    def test_empty_players_frame_returns_empty(self) -> None:
+        """No players parsed at all must not raise -- just an empty summary."""
+        result = summarize_squads(pd.DataFrame(), pd.DataFrame())
+        self.assertTrue(result.empty)
+
+    def test_aggregates_one_row_per_team_per_tournament(self) -> None:
+        """Two teams' squad files collapse into exactly two summary rows."""
+        poland = _parse_squad_text(_POLAND_2022_EXCERPT, "worldcup", 2022, "poland")
+        brazil = _parse_squad_text(_BRAZIL_1950_EXCERPT, "worldcup", 1950, "brazil")
+        players_frame = pd.concat([poland, brazil], ignore_index=True)
+        records = pd.DataFrame(
+            {
+                "tournament": ["FIFA World Cup", "FIFA World Cup"],
+                "match_date": pd.to_datetime(["2022-11-20", "1950-06-24"], utc=True),
+            }
+        )
+        summary = summarize_squads(players_frame, records)
+        self.assertEqual(len(summary), 2)
+        by_team = {row["team_slug"]: row for _, row in summary.iterrows()}
+        self.assertEqual(by_team["poland"]["squad_size"], 3)
+        self.assertEqual(by_team["brazil"]["squad_size"], 3)
+        # Real cohesion field must survive the refactor too.
+        self.assertEqual(by_team["poland"]["largest_club_cluster_size"], 0)
+
+    def test_continuity_ratio_uses_the_chronologically_prior_squad(self) -> None:
+        """Same team, two tournaments: the later one's continuity vs. the earlier."""
+        wc2018_text = _POLAND_2022_EXCERPT.replace("2022", "2018")
+        squad_2018 = _parse_squad_text(wc2018_text, "worldcup", 2018, "poland")
+        squad_2022 = _parse_squad_text(_POLAND_2022_EXCERPT, "worldcup", 2022, "poland")
+        players_frame = pd.concat([squad_2018, squad_2022], ignore_index=True)
+        records = pd.DataFrame(
+            {
+                "tournament": ["FIFA World Cup", "FIFA World Cup"],
+                "match_date": pd.to_datetime(["2018-06-14", "2022-11-20"], utc=True),
+            }
+        )
+        summary = summarize_squads(players_frame, records)
+        by_year = {int(row["tournament_year"]): row for _, row in summary.iterrows()}
+        self.assertTrue(pd.isna(by_year[2018]["squad_continuity_ratio"]))
+        # Identical roster both years -> full continuity for the later one.
+        self.assertEqual(by_year[2022]["squad_continuity_ratio"], 1.0)
+
+
+class NormalizeClubNameTestCase(unittest.TestCase):
+    """The minimal club-name normalization backing the Club Cohesion Index."""
+
+    def test_plain_club_name_is_lowercased(self) -> None:
+        """A plain club name is just case/accent-normalized."""
+        self.assertEqual(_normalize_club_name("Juventus"), "juventus")
+
+    def test_on_loan_suffix_is_stripped(self) -> None:
+        """Real case: "Aston Villa" and "Aston Villa (On Loan)" are the same club."""
+        self.assertEqual(_normalize_club_name("Aston Villa"), "aston villa")
+        self.assertEqual(_normalize_club_name("Aston Villa (On Loan)"), "aston villa")
+
+    def test_loan_suffix_is_case_insensitive(self) -> None:
+        """The real data has both "(On Loan)" and "(on loan)" casing."""
+        self.assertEqual(_normalize_club_name("Juventus (on loan)"), "juventus")
+
+    def test_empty_string_returns_none(self) -> None:
+        """A blank cell must not become a fake club named "" that clusters everyone."""
+        self.assertIsNone(_normalize_club_name(""))
+
+
+class ClubCohesionIndexTestCase(unittest.TestCase):
+    """The largest-cluster-based cohesion index, not a flat pair count."""
+
+    def test_no_shared_clubs_returns_zero(self) -> None:
+        """A squad where every player is at a different club has no cohesion."""
+        players = pd.DataFrame(
+            {"Current Club": ["Juventus", "Barcelona", "Bayern Munich"]}
+        )
+        result = _club_cohesion_index(players)
+        self.assertEqual(result["largest_club_cluster_size"], 0)
+        self.assertIsNone(result["largest_club_cluster_name"])
+        self.assertEqual(result["largest_club_cluster_pairs"], 0)
+
+    def test_on_loan_variant_is_merged_into_the_same_cluster(self) -> None:
+        """Two Juventus players, one tagged "(On Loan)", must form one cluster of 2."""
+        players = pd.DataFrame(
+            {"Current Club": ["Juventus", "Juventus (On Loan)", "Barcelona"]}
+        )
+        result = _club_cohesion_index(players)
+        self.assertEqual(result["largest_club_cluster_size"], 2)
+        self.assertEqual(result["largest_club_cluster_name"], "juventus")
+        self.assertEqual(result["largest_club_cluster_pairs"], 1)
+
+    def test_largest_cluster_wins_over_flat_pair_count(self) -> None:
+        """One 5-player cluster (C(5,2)=10 pairs) beats five separate 2-player pairs.
+
+        Per the spec: a squad with one dominant cluster plays differently
+        than one with the same flat pair total spread across many small
+        pairs -- the headline metric must reflect that, not just "how many
+        pairs exist in total".
+        """
+        real_madrid_five = ["Real Madrid"] * 5
+        five_separate_pairs = [f"Club{i}" for i in range(5) for _ in range(2)]
+        players = pd.DataFrame({"Current Club": real_madrid_five + five_separate_pairs})
+        result = _club_cohesion_index(players)
+        self.assertEqual(result["largest_club_cluster_size"], 5)
+        self.assertEqual(result["largest_club_cluster_name"], "real madrid")
+        self.assertEqual(result["largest_club_cluster_pairs"], 10)
+        # 1 cluster of 5 (C(5,2)=10) + 5 clusters of 2 (C(2,2)=1 each) = 15.
+        self.assertEqual(result["total_intra_club_pairs"], 15)
+
+    def test_missing_current_club_column_returns_zero_not_a_crash(self) -> None:
+        """A frame without a "Current Club" column at all must degrade gracefully."""
+        players = pd.DataFrame({"player_name": ["A", "B"]})
+        result = _club_cohesion_index(players)
+        self.assertEqual(result["largest_club_cluster_size"], 0)
+
+    def test_squad_summary_includes_the_cohesion_index(self) -> None:
+        """_squad_summary's output dict must carry the cohesion fields too."""
+        frame = _parse_squad_text(_POLAND_2022_EXCERPT, "worldcup", 2022, "poland")
+        summary = _squad_summary(frame, "worldcup", 2022, "poland", None)
+        self.assertIn("largest_club_cluster_size", summary)
+        self.assertIn("total_intra_club_pairs", summary)
 
 
 if __name__ == "__main__":

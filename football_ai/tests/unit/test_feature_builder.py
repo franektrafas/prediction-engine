@@ -6,7 +6,7 @@ import unittest
 
 import pandas as pd
 
-from football_ai.features.builder import build_features
+from football_ai.features.builder import build_features, merge_squad_indices
 from football_ai.features.schemas import FeatureBuilderConfig
 
 
@@ -177,6 +177,142 @@ class FeatureBuilderTestCase(unittest.TestCase):
         feature_result = build_features(matches)
         fourth_match = feature_result.frame.iloc[3]
         self.assertEqual(fourth_match["home_goals_for_mean_3_venue"], 2.0)
+
+
+class MergeSquadIndicesTestCase(unittest.TestCase):
+    """Regression tests for PROMPT_ZAMKNIECIE_WATKOW.md item 2's real gap.
+
+    The squad age/height/continuity/cohesion indices were computed by
+    `footballsquads.py` since 2026-08-20 but never merged into `matches` --
+    no model ever saw them. These tests cover the fix: `merge_squad_indices`
+    (and `build_features`'s optional `squad_summary` parameter that calls
+    it).
+    """
+
+    _SUMMARY = pd.DataFrame(
+        [
+            {
+                "competition": "worldcup",
+                "team_name": "Poland",
+                "tournament_start_date": pd.Timestamp("2022-11-20", tz="UTC"),
+                "average_age_years": 28.5,
+                "average_height_m": 1.85,
+                "squad_continuity_ratio": 0.6,
+                "largest_club_cluster_size": 2,
+                "largest_club_cluster_pairs": 1,
+                "total_intra_club_pairs": 2,
+            },
+            {
+                "competition": "worldcup",
+                "team_name": "France",
+                "tournament_start_date": pd.Timestamp("2022-11-20", tz="UTC"),
+                "average_age_years": 26.1,
+                "average_height_m": 1.83,
+                "squad_continuity_ratio": 0.8,
+                "largest_club_cluster_size": 3,
+                "largest_club_cluster_pairs": 3,
+                "total_intra_club_pairs": 3,
+            },
+        ]
+    )
+
+    def test_covered_tournament_match_gets_both_sides_squad_indices(self) -> None:
+        """A real World Cup match near the squad's start date picks up both sides."""
+        matches = pd.DataFrame(
+            [
+                {
+                    "match_date": "2022-11-26",
+                    "home_team_name": "Poland",
+                    "away_team_name": "France",
+                    "tournament": "FIFA World Cup",
+                    "home_score": 0,
+                    "away_score": 0,
+                }
+            ]
+        )
+        merged = merge_squad_indices(matches, self._SUMMARY)
+        self.assertEqual(merged["home_squad_average_age_years"].iloc[0], 28.5)
+        self.assertEqual(merged["away_squad_average_age_years"].iloc[0], 26.1)
+        self.assertEqual(merged["home_squad_largest_club_cluster_size"].iloc[0], 2)
+
+    def test_uncovered_tournament_stays_none_not_fabricated(self) -> None:
+        """A friendly (not one of the five covered competitions) must get NaN, not 0."""
+        matches = pd.DataFrame(
+            [
+                {
+                    "match_date": "2022-11-26",
+                    "home_team_name": "Poland",
+                    "away_team_name": "France",
+                    "tournament": "Friendly",
+                    "home_score": 1,
+                    "away_score": 1,
+                }
+            ]
+        )
+        merged = merge_squad_indices(matches, self._SUMMARY)
+        self.assertTrue(pd.isna(merged["home_squad_average_age_years"].iloc[0]))
+
+    def test_match_far_outside_tolerance_does_not_pick_up_a_stale_squad(self) -> None:
+        """A match years after the squad's tournament must not inherit that old squad.
+
+        Real scenario this guards against: without a bounded `tolerance`,
+        `merge_asof(direction="backward")` would keep matching a team's
+        *next* World Cup qualifier -- years later -- to its old squad
+        snapshot, since "the nearest earlier row" has no natural cutoff on
+        its own.
+        """
+        matches = pd.DataFrame(
+            [
+                {
+                    "match_date": "2025-03-15",
+                    "home_team_name": "Poland",
+                    "away_team_name": "France",
+                    "tournament": "FIFA World Cup",
+                    "home_score": 2,
+                    "away_score": 0,
+                }
+            ]
+        )
+        merged = merge_squad_indices(matches, self._SUMMARY)
+        self.assertTrue(pd.isna(merged["home_squad_average_age_years"].iloc[0]))
+
+    def test_never_overwrites_an_existing_column(self) -> None:
+        """If `matches` already has a same-named column, the real one must win."""
+        matches = pd.DataFrame(
+            [
+                {
+                    "match_date": "2022-11-26",
+                    "home_team_name": "Poland",
+                    "away_team_name": "France",
+                    "tournament": "FIFA World Cup",
+                    "home_score": 0,
+                    "away_score": 0,
+                    "home_squad_average_age_years": 99.9,
+                }
+            ]
+        )
+        merged = merge_squad_indices(matches, self._SUMMARY)
+        self.assertEqual(merged["home_squad_average_age_years"].iloc[0], 99.9)
+
+    def test_build_features_surfaces_squad_indices_as_numeric_features(self) -> None:
+        """End-to-end: passing squad_summary makes the indices real, usable features."""
+        matches = pd.DataFrame(
+            [
+                {
+                    "match_date": f"2022-11-{day:02d}",
+                    "home_team_name": "Poland",
+                    "away_team_name": "France",
+                    "tournament": "FIFA World Cup",
+                    "home_score": 1,
+                    "away_score": 0,
+                }
+                for day in (20, 26)
+            ]
+        )
+        feature_result = build_features(matches, squad_summary=self._SUMMARY)
+        numeric_columns = feature_result.numeric_columns
+        self.assertIn("home_squad_average_age_years", numeric_columns)
+        self.assertIn("away_squad_largest_club_cluster_size", numeric_columns)
 
 
 if __name__ == "__main__":

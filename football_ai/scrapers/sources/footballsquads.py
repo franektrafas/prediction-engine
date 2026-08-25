@@ -257,6 +257,64 @@ def _position_bucket(position: str) -> str | None:
     return None
 
 
+_LOAN_SUFFIX_PATTERN = re.compile(r"\s*\((?:on loan|loan)\)\s*$", re.IGNORECASE)
+
+
+def _normalize_club_name(raw_club: str) -> str | None:
+    """Normalize a "Current Club" cell for cohesion-index grouping.
+
+    Minimal, not a full alias table (no club equivalent of
+    `config.team_aliases` exists in this project yet, and one club-name
+    task doesn't warrant building one) -- strips the real, high-volume
+    "(On Loan)" suffix confirmed in the actual data (820 of 2,887 unique
+    raw club strings, 2026-08-25: e.g. "Aston Villa" and "Aston Villa (On
+    Loan)" are the same club, appearing as two different strings only
+    because one player's row happens to be a loan spell), then reuses
+    `normalize_text` (accent/case) already used elsewhere in this module
+    for continuity matching. Doesn't catch every real-world variant (e.g.
+    "Tottenham H" vs "Tottenham Hotspur") -- a genuine limitation, not
+    silently pretended away.
+    """
+    without_loan_suffix = _LOAN_SUFFIX_PATTERN.sub("", raw_club)
+    normalized = normalize_text(without_loan_suffix)
+    return normalized or None
+
+
+def _club_cohesion_index(players: pd.DataFrame) -> dict[str, object]:
+    """Club Cohesion Index: how concentrated a squad is at its largest shared club.
+
+    Per `PROMPT_FOOTBALLSQUADS.md`'s spec: not a flat pair count -- a squad
+    with one 5-player cluster at the same club plays differently than one
+    with five unrelated pairs, even at the same total pair count, so the
+    headline number is the *largest* cluster's size (converted to
+    C(n,2) connected pairs), with the sum across every 2+ cluster kept as
+    a secondary total. A fact for `insights/`+`narrative/` first, per that
+    spec -- deliberately not merged into `features/builder.py` here.
+    """
+    raw_clubs = players.get("Current Club", pd.Series(dtype=object))
+    normalized_clubs = raw_clubs.dropna().map(_normalize_club_name).dropna()
+    cluster_sizes = normalized_clubs.value_counts()
+    shared_clusters = cluster_sizes[cluster_sizes >= 2]
+
+    if shared_clusters.empty:
+        return {
+            "largest_club_cluster_size": 0,
+            "largest_club_cluster_name": None,
+            "largest_club_cluster_pairs": 0,
+            "total_intra_club_pairs": 0,
+        }
+
+    largest_size = int(shared_clusters.iloc[0])
+    largest_name = str(shared_clusters.index[0])
+    total_pairs = int(sum(size * (size - 1) // 2 for size in shared_clusters))
+    return {
+        "largest_club_cluster_size": largest_size,
+        "largest_club_cluster_name": largest_name,
+        "largest_club_cluster_pairs": largest_size * (largest_size - 1) // 2,
+        "total_intra_club_pairs": total_pairs,
+    }
+
+
 def _squad_summary(
     players: pd.DataFrame,
     competition: str,
@@ -298,6 +356,7 @@ def _squad_summary(
         "average_height_m": average_height,
         "height_known_count": int(len(heights)),
         **position_counts,
+        **_club_cohesion_index(players),
     }
 
 
@@ -318,6 +377,56 @@ def _continuity_ratio(
         return 0.0
     overlap = len(current_names & previous_names)
     return overlap / len(current_names)
+
+
+def summarize_squads(
+    players_frame: pd.DataFrame, records_frame: pd.DataFrame
+) -> pd.DataFrame:
+    """Aggregate an already-parsed `players_frame` into per-team-per-tournament rows.
+
+    Shared by `FootballSquadsSource.build_squads()` (fresh fetch) and any
+    offline recomputation from the cached `tournament_squads_players.parquet`
+    -- e.g. after adding a new summary field, there's no need to re-fetch
+    every file from GitHub, only to re-run this aggregation over what's
+    already been fetched and parsed. Groups are visited in the same
+    (competition, tournament_year, team_slug) order `build_squads()` used to
+    walk `refs_sorted`, so `squad_continuity_ratio` (which depends on visit
+    order, comparing each squad against the chronologically previous one for
+    that team+competition) matches what a live re-fetch would produce.
+    """
+    if players_frame.empty:
+        return pd.DataFrame()
+
+    summary_rows: list[dict[str, object]] = []
+    previous_squad_names: dict[tuple[str, str], set[str]] = {}
+    group_keys = (
+        players_frame[["competition", "tournament_year", "team_slug"]]
+        .drop_duplicates()
+        .sort_values(["competition", "tournament_year", "team_slug"])
+    )
+    for _, key_row in group_keys.iterrows():
+        competition = key_row["competition"]
+        year = int(key_row["tournament_year"])
+        team_slug = key_row["team_slug"]
+        players = players_frame.loc[
+            (players_frame["competition"] == competition)
+            & (players_frame["tournament_year"] == year)
+            & (players_frame["team_slug"] == team_slug)
+        ]
+
+        tournament_start = _tournament_start_date(records_frame, competition, year)
+        summary_rows.append(
+            _squad_summary(players, competition, year, team_slug, tournament_start)
+        )
+
+        current_names = {normalize_text(name) for name in players["player_name"]}
+        team_key = (competition, team_slug)
+        summary_rows[-1]["squad_continuity_ratio"] = _continuity_ratio(
+            current_names, previous_squad_names.get(team_key, set())
+        )
+        previous_squad_names[team_key] = current_names
+
+    return pd.DataFrame(summary_rows)
 
 
 class FootballSquadsSource(BaseDataSource):
@@ -370,19 +479,16 @@ class FootballSquadsSource(BaseDataSource):
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Fetch and parse every squad file, returning (players_frame, summary_frame).
 
-        `players_frame` is one row per player per tournament (raw).
-        `summary_frame` is one row per team per tournament (aggregated) --
-        computed here rather than left for callers to derive on demand,
-        since continuity requires comparing against the chronologically
-        previous tournament's squad, which needs the full set built first.
+        `players_frame` is one row per player per tournament (raw). The
+        aggregation into `summary_frame` is delegated to `summarize_squads()`
+        so a later re-aggregation (e.g. after adding a new summary field)
+        can run offline against an already-fetched `players_frame` without
+        re-fetching every file from GitHub.
         """
         if refs is None:
             refs = self.list_squad_files()
 
         player_frames: list[pd.DataFrame] = []
-        summary_rows: list[dict[str, object]] = []
-        previous_squad_names: dict[tuple[str, str], set[str]] = {}
-
         refs_sorted = sorted(
             refs, key=lambda ref: (ref.competition, ref.year, ref.team_slug)
         )
@@ -402,28 +508,12 @@ class FootballSquadsSource(BaseDataSource):
                 continue
             player_frames.append(players)
 
-            tournament_start = _tournament_start_date(
-                records_frame, ref.competition, ref.year
-            )
-            summary_rows.append(
-                _squad_summary(
-                    players, ref.competition, ref.year, ref.team_slug, tournament_start
-                )
-            )
-
-            current_names = {normalize_text(name) for name in players["player_name"]}
-            team_key = (ref.competition, ref.team_slug)
-            summary_rows[-1]["squad_continuity_ratio"] = _continuity_ratio(
-                current_names, previous_squad_names.get(team_key, set())
-            )
-            previous_squad_names[team_key] = current_names
-
         players_frame = (
             pd.concat(player_frames, ignore_index=True)
             if player_frames
             else pd.DataFrame()
         )
-        summary_frame = pd.DataFrame(summary_rows)
+        summary_frame = summarize_squads(players_frame, records_frame)
         return players_frame, summary_frame
 
 

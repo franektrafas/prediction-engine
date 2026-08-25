@@ -13,6 +13,7 @@ from football_ai.data.normalization import (
     compute_match_outcome,
 )
 from football_ai.features.schemas import FeatureBuildResult, FeatureBuilderConfig
+from football_ai.scrapers.sources.footballsquads import _COMPETITION_TOURNAMENT_NAMES
 
 
 BASE_MATCH_COLUMNS = [
@@ -573,9 +574,99 @@ def _build_targets(frame: pd.DataFrame, source_columns: set[str]) -> dict[str, p
     return targets
 
 
+_SQUAD_SUMMARY_NUMERIC_FIELDS = (
+    "average_age_years",
+    "average_height_m",
+    "squad_continuity_ratio",
+    "largest_club_cluster_size",
+    "largest_club_cluster_pairs",
+    "total_intra_club_pairs",
+)
+_SQUAD_MERGE_TOLERANCE = pd.Timedelta(days=45)
+
+
+def merge_squad_indices(
+    matches: pd.DataFrame, squad_summary: pd.DataFrame
+) -> pd.DataFrame:
+    """Attach each side's tournament-squad indices (age/height/continuity/cohesion).
+
+    `squad_summary` is `footballsquads.py`'s per-team-per-tournament output
+    (`FootballSquadsSource.build_squads()`'s second return value, i.e.
+    `tournament_squads_summary.parquet`) -- CONFIRMED REAL GAP found
+    2026-08-25 auditing `PROMPT_ZAMKNIECIE_WATKOW.md`'s item 2: these
+    indices were computed but never merged anywhere, so no model ever saw
+    them despite the source existing since 2026-08-20. One row per team per
+    *tournament instance*, not per match, so this only ever covers a match
+    whose `tournament` is one of the five footballsquads-covered
+    competitions and whose date falls near that instance's run -- matched
+    via `merge_asof` per (team, competition), taking the most recent squad
+    snapshot at-or-before the match. `tolerance` bounds "at-or-before" to a
+    single tournament's own duration (45 days comfortably covers all five:
+    World Cup ~32 days is the longest) so a team's NEXT tournament years
+    later can never be mistaken for a match near this one. Every other
+    match (friendlies, qualifiers, non-covered competitions -- the vast
+    majority of rows) gets `NaN` here, not a fabricated average: genuinely
+    unobserved, not zero.
+    """
+    if squad_summary.empty or "tournament" not in matches.columns:
+        return matches
+
+    competition_by_tournament = {
+        name: slug for slug, name in _COMPETITION_TOURNAMENT_NAMES.items()
+    }
+    numeric_fields = [
+        field
+        for field in _SQUAD_SUMMARY_NUMERIC_FIELDS
+        if field in squad_summary.columns
+    ]
+    if not numeric_fields:
+        return matches
+
+    summary = squad_summary.dropna(subset=["tournament_start_date"]).copy()
+    summary["team_name"] = summary["team_name"].map(canonicalize_team_name)
+    summary["_squad_date"] = pd.to_datetime(summary["tournament_start_date"], utc=True)
+    summary = summary[["competition", "team_name", "_squad_date", *numeric_fields]]
+
+    engineered = matches.copy()
+    engineered["_squad_competition"] = engineered["tournament"].map(
+        competition_by_tournament
+    )
+    engineered["_squad_date"] = pd.to_datetime(engineered["match_date"], utc=True)
+
+    for side, team_column in (("home", "home_team_name"), ("away", "away_team_name")):
+        side_frame = pd.DataFrame(
+            {
+                "_original_index": engineered.index,
+                "competition": engineered["_squad_competition"],
+                "team_name": engineered[team_column].map(canonicalize_team_name),
+                "_squad_date": engineered["_squad_date"],
+            }
+        ).sort_values("_squad_date")
+        joined = pd.merge_asof(
+            side_frame,
+            summary.sort_values("_squad_date"),
+            on="_squad_date",
+            by=["competition", "team_name"],
+            direction="backward",
+            tolerance=_SQUAD_MERGE_TOLERANCE,
+        ).set_index("_original_index")
+        joined = joined.reindex(engineered.index)
+        for field in numeric_fields:
+            # `field` is already "squad_continuity_ratio" for one entry --
+            # strip a leading "squad_" so the output name doesn't double up
+            # to "home_squad_squad_continuity_ratio".
+            output_column = f"{side}_squad_{field.removeprefix('squad_')}"
+            if output_column in engineered.columns:
+                continue  # matches already provides this column -- never overwrite it
+            engineered[output_column] = joined[field].to_numpy()
+
+    return engineered.drop(columns=["_squad_competition", "_squad_date"])
+
+
 def build_features(
     matches: pd.DataFrame,
     config: FeatureBuilderConfig | None = None,
+    squad_summary: pd.DataFrame | None = None,
 ) -> FeatureBuildResult:
     """Build automated feature tables from historical match rows."""
     feature_config = config or FeatureBuilderConfig()
@@ -614,6 +705,9 @@ def build_features(
         _source_column = f"{_side}_possession_pct"
         if _target_column not in matches.columns and _source_column in matches.columns:
             matches[_target_column] = matches[_source_column]
+
+    if squad_summary is not None:
+        matches = merge_squad_indices(matches, squad_summary)
 
     match_frame = matches.copy().sort_values("match_date").reset_index(drop=True)
     if "match_id" not in match_frame.columns:
