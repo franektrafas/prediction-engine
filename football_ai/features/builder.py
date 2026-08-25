@@ -210,18 +210,42 @@ def _add_rolling_features(
     frame: pd.DataFrame,
     config: FeatureBuilderConfig,
 ) -> pd.DataFrame:
-    """Create rolling team and venue-specific features."""
+    """Create rolling team and venue-specific features.
+
+    The venue split groups on `effective_is_home`, not raw `is_home` --
+    CONFIRMED REAL BUG (found via `PROMPT_HOME_ADVANTAGE_CHECK.md`'s
+    diagnostic, fixed 2026-08-25 per `PROMPT_ZAMKNIECIE_WATKOW.md`): raw
+    `is_home` is purely a positional label from the source data (whichever
+    side is listed as `home_team_name`), so a team playing a neutral-venue
+    match (a World Cup final, a Nations League tie on neutral ground) still
+    got that match folded into its "home" rolling bucket exactly as if it
+    had real home-crowd advantage. `effective_is_home` is 1 only when a
+    team is both listed as home AND the match isn't on neutral ground, so
+    neutral matches feed the away/`False` bucket for both sides instead --
+    the model can then only learn genuine home advantage from truly-home
+    matches, not from a data leak of the label alone. `neutral_venue` is
+    treated as all-False (i.e. this is a no-op, matching prior behavior)
+    when the column isn't present in `frame` at all, consistent with this
+    project's "not every source has every field" rule elsewhere in this
+    module (see `_add_tournament_host_flag`).
+    """
     engineered = frame.copy()
+    if "neutral_venue" in engineered.columns:
+        effective_is_home = engineered["is_home"] & (~engineered["neutral_venue"])
+    else:
+        effective_is_home = engineered["is_home"]
     derived_columns: dict[str, pd.Series] = {}
     for metric in config.rolling_metrics:
         for window in config.rolling_windows:
             shifted = engineered.groupby("team_name")[metric].shift(1)
-            venue_shifted = engineered.groupby(["team_name", "is_home"])[metric].shift(1)
+            venue_shifted = engineered.groupby(
+                ["team_name", effective_is_home]
+            )[metric].shift(1)
             rolling_all = shifted.groupby(engineered["team_name"]).rolling(
                 window=window, min_periods=1
             )
             rolling_venue = venue_shifted.groupby(
-                [engineered["team_name"], engineered["is_home"]]
+                [engineered["team_name"], effective_is_home]
             ).rolling(window=window, min_periods=1)
             for aggregation in config.rolling_aggregations:
                 derived_columns[f"{metric}_{aggregation}_{window}"] = (
@@ -555,6 +579,42 @@ def build_features(
 ) -> FeatureBuildResult:
     """Build automated feature tables from historical match rows."""
     feature_config = config or FeatureBuilderConfig()
+
+    # CONFIRMED REAL naming mismatch (found 2026-08-19 diagnosing why every
+    # `home_possession`/`away_possession` prediction came back as the same
+    # hardcoded default regardless of the match): `scrapers/sources/espn.py`'s
+    # `_STAT_NAME_MAP` -- the only enrichment source that supplies possession
+    # at all -- emits `home_possession_pct`/`away_possession_pct` (matching
+    # `database/models.py`'s `TeamStatistic.possession_pct` and the
+    # `records_frame`/Streamlit heatmap's own "possession_pct" convention),
+    # while `_build_targets` below and `build_team_match_frame` both only ever
+    # look for `home_possession`/`away_possession` (no `_pct`). Since
+    # `data.enrichment.merge_advanced_stats` merges supplemental columns under
+    # whatever name they already have -- no semantic renaming -- the `_pct`
+    # column always lands in the wide `matches` frame under its ESPN name and
+    # `home_possession` never exists, so `run_training()` silently skips the
+    # target every single time regardless of how much real possession data
+    # was actually fetched. Aliased here (added, not renamed) rather than
+    # fixed at the ESPN source, because `_STAT_NAME_MAP`'s "possession_pct"
+    # name is a real, separate contract other consumers (the DB model, the
+    # records-frame heatmap) already depend on -- renaming it there would fix
+    # this and break those. Reassigned onto `matches` itself, before
+    # `match_frame` is derived from it and before `source_columns` below reads
+    # `matches.columns` -- `_build_targets`'s docstring is explicit that
+    # `source_columns` must reflect the true original input, not a
+    # `_safe_series`-filled pass-through, so the alias has to land on `matches`
+    # itself, not just on the `match_frame` copy, or `_build_targets` would
+    # still never see it. This is the one shared frame both
+    # `training/orchestrator.py` and `predictions/inference_feature_builder.py`
+    # build features from, so training and inference stay on the same code
+    # path per this module's own invariant.
+    matches = matches.copy()
+    for _side in ("home", "away"):
+        _target_column = f"{_side}_possession"
+        _source_column = f"{_side}_possession_pct"
+        if _target_column not in matches.columns and _source_column in matches.columns:
+            matches[_target_column] = matches[_source_column]
+
     match_frame = matches.copy().sort_values("match_date").reset_index(drop=True)
     if "match_id" not in match_frame.columns:
         match_frame["match_id"] = np.arange(1, len(match_frame) + 1)
@@ -695,6 +755,21 @@ def build_features(
         # (red cards are rare, so cards ~= yellow_cards for most rows).
         "cards",
         "fouls",
+        # CONFIRMED REAL LEAK, same class as "cards" above (found 2026-08-19
+        # auditing why home_possession/away_possession scored a suspicious
+        # test R^2 of 0.99+): the real source columns are spelled
+        # "fouls_committed", "total_passes" and "pass_pct" -- "fouls" and
+        # "passes_completed"/"passes_attempted" below never matched them, so
+        # home_pass_pct/away_pass_pct/home_total_passes/away_total_passes/
+        # home_fouls_committed/away_fouls_committed flowed into the possession
+        # models unguarded. Post-match pass accuracy is a near-restatement of
+        # possession, which is exactly what inflated that R^2 -- and at real
+        # /predict time none of those columns exist yet for a future match,
+        # so the model was learning to lean on a signal it will never
+        # actually have at inference.
+        "fouls_committed",
+        "total_passes",
+        "pass_pct",
         "offsides",
         "passes_completed",
         "passes_attempted",

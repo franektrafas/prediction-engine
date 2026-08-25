@@ -149,6 +149,35 @@ class FeatureBuilderTestCase(unittest.TestCase):
         third_match = feature_result.frame.iloc[2]
         self.assertEqual(third_match["home_xg_mean_3"], 2.0)
 
+    def test_neutral_venue_does_not_contaminate_true_home_rolling(self) -> None:
+        """Regression test for the neutral-venue home-advantage bug (fixed 2026-08-25).
+
+        Before the fix, the venue-split rolling bucket grouped purely on
+        `is_home` -- a team listed as home on a neutral-venue match (a World
+        Cup final, a Nations League tie on neutral ground) still fed that
+        match into its "true home" rolling average, exactly as if it had
+        real home-crowd advantage. Poland's third match here is a neutral
+        "home" match with an extreme, distinct goals_for=99 -- if it leaked
+        into the true-home bucket, the 4th match's `home_goals_for_mean_3_venue`
+        would be pulled far above 3 (mean of 1, 3, 99); with the fix, it must
+        reflect only the two real home matches (1, 3), i.e. exactly 2.0.
+        """
+        matches = pd.DataFrame(
+            [
+                {"match_date": "2024-01-01", "home_team_name": "Poland", "away_team_name": "England",
+                 "home_score": 1, "away_score": 0, "neutral_venue": False},
+                {"match_date": "2024-01-05", "home_team_name": "Poland", "away_team_name": "France",
+                 "home_score": 3, "away_score": 1, "neutral_venue": False},
+                {"match_date": "2024-01-09", "home_team_name": "Poland", "away_team_name": "Brazil",
+                 "home_score": 99, "away_score": 0, "neutral_venue": True},
+                {"match_date": "2024-01-13", "home_team_name": "Poland", "away_team_name": "Germany",
+                 "home_score": 5, "away_score": 2, "neutral_venue": False},
+            ]
+        )
+        feature_result = build_features(matches)
+        fourth_match = feature_result.frame.iloc[3]
+        self.assertEqual(fourth_match["home_goals_for_mean_3_venue"], 2.0)
+
 
 if __name__ == "__main__":
     unittest.main()
