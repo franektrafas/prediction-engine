@@ -3,11 +3,19 @@
 Loads martj42's results/goalscorers/shootouts (via `database.loaders`) plus
 provenance rows for every statistic that has a real source -- final_score
 from martj42 (VERIFIED, CC0), and any ESPN-sourced team stats found in
-`records_frame` (shots/corners/cards/possession/...) tagged UNKNOWN/LOW,
-not VERIFIED -- `scrapers/sources/espn.py`'s own docstring is explicit that
-this is "not an official/published API", so its legal status has never
-been confirmed the way martj42's CC0 licensing has. That distinction is
-the entire point of building a provenance ledger instead of one flat table.
+`records_frame` (shots/corners/cards/possession/...) tagged FORBIDDEN.
+
+Confirmed 2026-08-20 against Disney's Terms of Use (ESPN is a Disney
+property; `scrapers/sources/espn.py`'s own docstring already called it
+"not an official/published API", but the operative text is stronger than
+that: "no right to reproduce, distribute... or transform any Disney
+Product, including in connection with any... training, testing,
+benchmarking or validation of any artificial intelligence or machine
+learning tool" plus a blanket "we do not allow uses... that are commercial
+or business-related" -- not silence, an explicit bar with no
+research-only carve-out. This is exactly why the provenance ledger exists
+instead of one flat table: the identity/score data in the same wide row
+stays VERIFIED, only the ESPN-derived stat columns are FORBIDDEN.
 
 Faza 10 (coverage report) runs automatically at the end via
 `data_quality.report`.
@@ -39,12 +47,13 @@ from football_ai.scrapers.sources.international_results import (
 
 LOGGER = logging.getLogger(__name__)
 
-# ESPN's site API is real data but was never license-confirmed (see
-# scrapers/sources/espn.py's own docstring: "not an official/published
-# API") -- provenance rows for its stats must say so, not inherit
-# martj42's VERIFIED status just because they live in the same wide row.
+# ESPN's site API is real data, but confirmed FORBIDDEN for this use (see
+# module docstring: Disney's Terms of Use bars both AI/ML training and
+# commercial use outright) -- provenance rows for its stats must say so,
+# not inherit martj42's VERIFIED status just because they live in the
+# same wide row.
 _ESPN_SOURCE = "espn_undocumented_api"
-_ESPN_LICENSE = "unknown"
+_ESPN_LICENSE = "unknown (Disney ToU bars this use -- see module docstring)"
 _ESPN_STAT_COLUMNS = {
     "shots": ("home_shots", "away_shots"),
     "shots_on_target": ("home_shots_on_target", "away_shots_on_target"),
@@ -89,7 +98,7 @@ def _record_espn_stat_provenance(
     matches_by_id: dict,
     retrieved_at: datetime,
 ) -> int:
-    """Record ESPN-sourced team statistics, marked UNKNOWN/LOW, not VERIFIED."""
+    """Record ESPN-sourced team statistics, marked FORBIDDEN, not VERIFIED."""
     available = {
         name: (home_col, away_col)
         for name, (home_col, away_col) in _ESPN_STAT_COLUMNS.items()
@@ -116,7 +125,7 @@ def _record_espn_stat_provenance(
                 away_value=float(away_value),
                 source=_ESPN_SOURCE,
                 source_license=_ESPN_LICENSE,
-                license_status="UNKNOWN",
+                license_status="FORBIDDEN",
                 confidence="LOW",
                 retrieved_at=retrieved_at,
             )

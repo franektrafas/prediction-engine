@@ -89,6 +89,35 @@ class FindUnverifiedLicensesTestCase(unittest.TestCase):
         issues = provenance_checks.find_unverified_licenses(frame)
         self.assertEqual(len(issues), 1)
 
+    def test_forbidden_status_is_excluded_here(self) -> None:
+        """FORBIDDEN gets its own louder check, not lumped in with UNKNOWN."""
+        frame = pd.DataFrame([_provenance_row(license_status="FORBIDDEN")])
+        self.assertEqual(provenance_checks.find_unverified_licenses(frame), [])
+
+
+class FindForbiddenLicensesTestCase(unittest.TestCase):
+    """A confirmed violation (e.g. ESPN under Disney's ToS) is an error."""
+
+    def test_verified_row_passes(self) -> None:
+        """A VERIFIED row is never flagged."""
+        frame = pd.DataFrame([_provenance_row(license_status="VERIFIED")])
+        self.assertEqual(provenance_checks.find_forbidden_licenses(frame), [])
+
+    def test_unknown_row_passes(self) -> None:
+        """An UNKNOWN row isn't a confirmed violation, so it's not flagged here."""
+        frame = pd.DataFrame([_provenance_row(license_status="UNKNOWN")])
+        self.assertEqual(provenance_checks.find_forbidden_licenses(frame), [])
+
+    def test_forbidden_row_is_an_error(self) -> None:
+        """A FORBIDDEN row (e.g. ESPN stats) must be flagged as an error."""
+        frame = pd.DataFrame(
+            [_provenance_row(license_status="FORBIDDEN", source="espn_api")]
+        )
+        issues = provenance_checks.find_forbidden_licenses(frame)
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].severity, "error")
+        self.assertEqual(issues[0].check_name, "forbidden_license_used")
+
 
 class FindConflictingSourcesTestCase(unittest.TestCase):
     """The conflict-preserving heart of the Data Provenance Layer."""
@@ -168,6 +197,16 @@ class RunAllChecksTestCase(unittest.TestCase):
         check_names = {issue.check_name for issue in issues}
         self.assertIn("missing_source", check_names)
         self.assertIn("unverified_license", check_names)
+
+    def test_forbidden_rows_surface_as_errors_in_the_combined_run(self) -> None:
+        """A FORBIDDEN row must show up loudly even in the combined check run."""
+        frame = pd.DataFrame([_provenance_row(license_status="FORBIDDEN")])
+        issues = provenance_checks.run_all_checks(frame)
+        forbidden_issues = [
+            issue for issue in issues if issue.check_name == "forbidden_license_used"
+        ]
+        self.assertEqual(len(forbidden_issues), 1)
+        self.assertEqual(forbidden_issues[0].severity, "error")
 
 
 if __name__ == "__main__":

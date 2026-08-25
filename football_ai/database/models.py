@@ -267,9 +267,13 @@ class MatchStatisticSource(Base):
     table's shape.
 
     `license_status`/`confidence` reuse the exact vocabulary from the
-    project's own Data Engine source audit (VERIFIED/RESEARCH_ONLY/UNKNOWN;
-    HIGH/MEDIUM_HIGH/LOW/UNKNOWN) so a row here means the same thing it
-    means in that audit, not a parallel taxonomy.
+    project's own Data Engine source audit (VERIFIED/RESEARCH_ONLY/UNKNOWN/
+    FORBIDDEN; HIGH/MEDIUM_HIGH/LOW/UNKNOWN) so a row here means the same
+    thing it means in that audit, not a parallel taxonomy. FORBIDDEN added
+    2026-08-20 after confirming ESPN-sourced statistics (already loaded
+    here at import time) are barred by Disney's Terms of Use even for
+    non-commercial research use, not just production ML -- stronger than
+    RESEARCH_ONLY, which still permits internal experimentation.
     """
 
     __tablename__ = "match_sources"
@@ -283,7 +287,7 @@ class MatchStatisticSource(Base):
             name="uq_match_sources_match_stat_source_retrieved",
         ),
         CheckConstraint(
-            "license_status IN ('VERIFIED', 'RESEARCH_ONLY', 'UNKNOWN')",
+            "license_status IN ('VERIFIED', 'RESEARCH_ONLY', 'UNKNOWN', 'FORBIDDEN')",
             name="ck_match_sources_license_status",
         ),
         CheckConstraint(

@@ -63,16 +63,21 @@ def find_missing_license_status(provenance_frame: pd.DataFrame) -> list[QualityI
 
 
 def find_unverified_licenses(provenance_frame: pd.DataFrame) -> list[QualityIssue]:
-    """Flag rows whose license_status isn't VERIFIED -- informational, not an error.
+    """Flag UNKNOWN/RESEARCH_ONLY rows -- informational, not an error.
 
-    Per the project's own rule, `UNKNOWN`/`RESEARCH_ONLY` rows aren't
-    necessarily wrong, but they must never silently feed production ML --
-    this surfaces them so a caller can filter before training, rather than
-    treating "present in the table" as "safe to use".
+    Per the project's own rule, these aren't necessarily wrong, but they
+    must never silently feed production ML -- this surfaces them so a
+    caller can filter before training, rather than treating "present in
+    the table" as "safe to use". FORBIDDEN rows are excluded here --
+    they're not a softer "not yet verified" case, they're a confirmed
+    violation, and get their own louder check (`find_forbidden_licenses`)
+    instead of being lumped into this warning-level one.
     """
     if "license_status" not in provenance_frame.columns:
         return []
-    unverified = provenance_frame[provenance_frame["license_status"] != "VERIFIED"]
+    unverified = provenance_frame[
+        ~provenance_frame["license_status"].isin(["VERIFIED", "FORBIDDEN"])
+    ]
     return [
         QualityIssue(
             check_name="unverified_license",
@@ -86,6 +91,35 @@ def find_unverified_licenses(provenance_frame: pd.DataFrame) -> list[QualityIssu
             subject=row.get("match_id", index),
         )
         for index, row in unverified.iterrows()
+    ]
+
+
+def find_forbidden_licenses(provenance_frame: pd.DataFrame) -> list[QualityIssue]:
+    """Flag rows whose license_status is FORBIDDEN -- a confirmed violation.
+
+    Distinct from `find_unverified_licenses`: this isn't "we haven't
+    checked yet", it's "we checked, and this source (e.g. ESPN under
+    Disney's Terms of Use, confirmed 2026-08-20) explicitly bars this use".
+    Any of these rows reaching a production training dataset is a real bug,
+    not a caution -- hence "error", matching this project's other
+    factually-impossible-value checks.
+    """
+    if "license_status" not in provenance_frame.columns:
+        return []
+    forbidden = provenance_frame[provenance_frame["license_status"] == "FORBIDDEN"]
+    return [
+        QualityIssue(
+            check_name="forbidden_license_used",
+            severity="error",
+            message=(
+                f"match_id={row.get('match_id', index)}, "
+                f"statistic={row.get('statistic_name')!r}: source "
+                f"{row.get('source')!r} is FORBIDDEN -- must never feed "
+                "production ML."
+            ),
+            subject=row.get("match_id", index),
+        )
+        for index, row in forbidden.iterrows()
     ]
 
 
@@ -144,5 +178,6 @@ def run_all_checks(provenance_frame: pd.DataFrame) -> list[QualityIssue]:
         *find_missing_source(provenance_frame),
         *find_missing_license_status(provenance_frame),
         *find_unverified_licenses(provenance_frame),
+        *find_forbidden_licenses(provenance_frame),
         *find_conflicting_sources(provenance_frame),
     ]

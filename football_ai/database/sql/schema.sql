@@ -176,7 +176,10 @@ CREATE TABLE IF NOT EXISTS player_statistics (
 -- sources disagree, both rows are kept (never drop a source); resolving the
 -- canonical value by Source Priority is a query-time concern, not enforced
 -- by this table's shape. license_status/confidence reuse the exact
--- vocabulary from the project's own Data Engine source audit.
+-- vocabulary from the project's own Data Engine source audit. FORBIDDEN
+-- added 2026-08-20: stronger than RESEARCH_ONLY (which still permits
+-- internal experimentation) -- for sources barred even from non-commercial
+-- research use, e.g. ESPN-sourced stats under Disney's Terms of Use.
 CREATE TABLE IF NOT EXISTS match_sources (
     id BIGSERIAL PRIMARY KEY,
     match_id BIGINT NOT NULL REFERENCES matches(id),
@@ -189,7 +192,7 @@ CREATE TABLE IF NOT EXISTS match_sources (
     source_license VARCHAR(64) NOT NULL,
     license_status VARCHAR(16) NOT NULL
         CONSTRAINT ck_match_sources_license_status
-        CHECK (license_status IN ('VERIFIED', 'RESEARCH_ONLY', 'UNKNOWN')),
+        CHECK (license_status IN ('VERIFIED', 'RESEARCH_ONLY', 'UNKNOWN', 'FORBIDDEN')),
     retrieved_at TIMESTAMPTZ NOT NULL,
     data_version VARCHAR(32),
     confidence VARCHAR(16) NOT NULL

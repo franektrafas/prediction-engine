@@ -144,7 +144,7 @@ class RecordFinalScoreProvenanceTestCase(unittest.TestCase):
 
 
 class RecordEspnStatProvenanceTestCase(unittest.TestCase):
-    """ESPN stats must never be marked VERIFIED -- their license was never confirmed."""
+    """ESPN stats are confirmed FORBIDDEN (Disney ToU), never VERIFIED."""
 
     def setUp(self) -> None:
         """Build a fresh in-memory schema plus one loaded match for each test."""
@@ -158,8 +158,8 @@ class RecordEspnStatProvenanceTestCase(unittest.TestCase):
         """Close the session after each test."""
         self.session.close()
 
-    def test_espn_stats_are_marked_unknown_not_verified(self) -> None:
-        """ESPN's undocumented API is real data, but never VERIFIED."""
+    def test_espn_stats_are_marked_forbidden_not_verified(self) -> None:
+        """ESPN's stats are confirmed FORBIDDEN under Disney's ToU, never VERIFIED."""
         retrieved_at = datetime(2026, 8, 20, tzinfo=UTC)
         count = _record_espn_stat_provenance(
             self.session, _RECORDS_FRAME, self.matches_by_id, retrieved_at
@@ -169,7 +169,7 @@ class RecordEspnStatProvenanceTestCase(unittest.TestCase):
         self.assertEqual(count, 1)
         row = self.session.execute(select(MatchStatisticSource)).scalars().one()
         self.assertEqual(row.statistic_name, "shots")
-        self.assertEqual(row.license_status, "UNKNOWN")
+        self.assertEqual(row.license_status, "FORBIDDEN")
         self.assertEqual(row.confidence, "LOW")
         self.assertEqual(row.home_value, 15.0)
         self.assertEqual(row.away_value, 12.0)

@@ -65,6 +65,21 @@ def _poisson_over_probability(expected_total_goals: float, threshold: float) -> 
     return _clamp_probability(1.0 - cumulative_probability)
 
 
+def _optional_pair(
+    home_value: float | None, away_value: float | None
+) -> dict[str, float] | None:
+    """`{"home": ..., "away": ...}` only when both sides have a real value, else `None`.
+
+    Used for stat targets that may have no registered model (see
+    `PredictionService._predict_regression_optional`) -- a pair with one
+    real side and one missing would be just as misleading as a fabricated
+    flat default, so both-or-nothing is the only honest option.
+    """
+    if home_value is None or away_value is None:
+        return None
+    return {"home": home_value, "away": away_value}
+
+
 def _poisson_btts_probability(home_expected_goals: float, away_expected_goals: float) -> float:
     """P(both sides score >= 1), assuming each side's goals ~ independent Poisson.
 
@@ -220,20 +235,24 @@ class PredictionService:
         away_goals = self._predict_regression("away_goals", match_frame, default=1.1)
         home_xg = self._predict_regression("home_xg", match_frame, default=home_goals)
         away_xg = self._predict_regression("away_xg", match_frame, default=away_goals)
-        home_corners = self._predict_regression("home_corners", match_frame, default=5.2)
-        away_corners = self._predict_regression("away_corners", match_frame, default=4.5)
-        home_cards = self._predict_regression("home_yellow_cards", match_frame, default=1.8)
-        away_cards = self._predict_regression("away_yellow_cards", match_frame, default=2.0)
-        home_shots = self._predict_regression("home_shots", match_frame, default=13.0)
-        away_shots = self._predict_regression("away_shots", match_frame, default=10.2)
-        home_shots_on_target = self._predict_regression(
-            "home_shots_on_target", match_frame, default=4.7
+        home_corners = self._predict_regression_optional("home_corners", match_frame)
+        away_corners = self._predict_regression_optional("away_corners", match_frame)
+        home_cards = self._predict_regression_optional("home_yellow_cards", match_frame)
+        away_cards = self._predict_regression_optional("away_yellow_cards", match_frame)
+        home_shots = self._predict_regression_optional("home_shots", match_frame)
+        away_shots = self._predict_regression_optional("away_shots", match_frame)
+        home_shots_on_target = self._predict_regression_optional(
+            "home_shots_on_target", match_frame
         )
-        away_shots_on_target = self._predict_regression(
-            "away_shots_on_target", match_frame, default=3.6
+        away_shots_on_target = self._predict_regression_optional(
+            "away_shots_on_target", match_frame
         )
-        home_possession = self._predict_regression("home_possession", match_frame, default=53.0)
-        away_possession = self._predict_regression("away_possession", match_frame, default=47.0)
+        home_possession = self._predict_regression_optional(
+            "home_possession", match_frame
+        )
+        away_possession = self._predict_regression_optional(
+            "away_possession", match_frame
+        )
         total_goals = home_goals + away_goals
         outcome_probabilities = self._resolve_outcome_probabilities(
             payload=payload,
@@ -288,12 +307,12 @@ class PredictionService:
             goals={"home": home_goals, "away": away_goals},
             btts=btts,
             over_under=over_under,
-            corners={"home": home_corners, "away": away_corners},
-            cards={"home": home_cards, "away": away_cards},
-            shots={"home": home_shots, "away": away_shots},
-            shots_on_target={"home": home_shots_on_target, "away": away_shots_on_target},
+            corners=_optional_pair(home_corners, away_corners),
+            cards=_optional_pair(home_cards, away_cards),
+            shots=_optional_pair(home_shots, away_shots),
+            shots_on_target=_optional_pair(home_shots_on_target, away_shots_on_target),
             xg={"home": home_xg, "away": away_xg},
-            possession={"home": home_possession, "away": away_possession},
+            possession=_optional_pair(home_possession, away_possession),
             match_context=_build_match_context(payload),
         )
 
@@ -446,6 +465,25 @@ class PredictionService:
         aligned, artifact = self._align_features(frame, registry_entry.artifact_path)
         return float(artifact.estimator.predict(aligned)[0])
 
+    def _predict_regression_optional(
+        self,
+        target_name: str,
+        frame: pd.DataFrame,
+    ) -> float | None:
+        """Predict a numeric target, or `None` when no model is registered.
+
+        Unlike `_predict_regression`, this never substitutes a flat
+        constant -- for a target that's been withdrawn (see
+        `models.registry.ModelRegistry.withdraw`), there's no real
+        prediction to make, and a hardcoded number that never varies by
+        team or match would misrepresent that as one.
+        """
+        registry_entry = self.registry.get_latest(target_name)
+        if registry_entry is None:
+            return None
+        aligned, artifact = self._align_features(frame, registry_entry.artifact_path)
+        return float(artifact.estimator.predict(aligned)[0])
+
     def _get_model_version(self, target_name: str) -> str | None:
         """Resolve the latest registered version for a target."""
         registry_entry = self.registry.get_latest(target_name)
@@ -488,11 +526,17 @@ class PredictionService:
                 "over_2_5": _poisson_over_probability(total_goals, 2.5),
                 "over_3_5": _poisson_over_probability(total_goals, 3.5),
             },
-            corners={"home": 5.2 + elo_diff, "away": 4.6 - elo_diff},
-            cards={"home": 1.8, "away": 1.9},
-            shots={"home": 13.5 + elo_diff * 2.5, "away": 10.8 - elo_diff * 2.0},
-            shots_on_target={"home": 4.9 + elo_diff, "away": 3.7 - elo_diff * 0.8},
+            # No registered model AND no trained-model fallback for these --
+            # unlike goals/xg (a genuine, if crude, Elo-driven heuristic),
+            # there's no real basis to invent corners/cards/shots/possession
+            # numbers at all, so these stay None rather than a formula
+            # dressed up as a prediction. See _predict_regression_optional's
+            # docstring in predict() for the same principle applied there.
+            corners=None,
+            cards=None,
+            shots=None,
+            shots_on_target=None,
             xg={"home": home_goals + 0.2, "away": away_goals + 0.15},
-            possession={"home": 52.5 + elo_diff * 6.0, "away": 47.5 - elo_diff * 6.0},
+            possession=None,
             match_context=_build_match_context(payload),
         )

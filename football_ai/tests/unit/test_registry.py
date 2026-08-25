@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+import json
 import tempfile
 import unittest
+from pathlib import Path
 
 from football_ai.models.registry import ModelRegistry, RegisteredModel
 
@@ -104,6 +105,90 @@ class RegistryTestCase(unittest.TestCase):
             )
             latest = registry.get_latest("btts")
             self.assertEqual(latest.model_name, "xgboost")
+
+    def test_withdraw_removes_target_from_active_serving(self) -> None:
+        """After withdraw(), get_latest() must return None for that target."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ModelRegistry(Path(temp_dir) / "registry.json")
+            registry.register(
+                RegisteredModel(
+                    model_name="selected_model",
+                    target_name="home_possession",
+                    task_type="regression",
+                    version="v1",
+                    artifact_path="/tmp/possession.joblib",
+                    metrics={"r2": 0.66},
+                )
+            )
+            withdrawn = registry.withdraw("home_possession", reason="ESPN license")
+            self.assertEqual(len(withdrawn), 1)
+            self.assertIsNone(registry.get_latest("home_possession"))
+
+    def test_withdraw_does_not_touch_other_targets(self) -> None:
+        """Withdrawing one target must leave every other target's entries intact."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ModelRegistry(Path(temp_dir) / "registry.json")
+            registry.register(
+                RegisteredModel(
+                    model_name="selected_model",
+                    target_name="match_outcome",
+                    task_type="multiclass",
+                    version="v1",
+                    artifact_path="/tmp/outcome.joblib",
+                    metrics={"f1": 0.6},
+                )
+            )
+            registry.register(
+                RegisteredModel(
+                    model_name="selected_model",
+                    target_name="home_possession",
+                    task_type="regression",
+                    version="v1",
+                    artifact_path="/tmp/possession.joblib",
+                    metrics={"r2": 0.66},
+                )
+            )
+            registry.withdraw("home_possession", reason="ESPN license")
+            self.assertIsNotNone(registry.get_latest("match_outcome"))
+
+    def test_withdraw_archives_entries_with_the_reason(self) -> None:
+        """Withdrawn entries must be recoverable, not deleted -- archived with why."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry_path = Path(temp_dir) / "registry.json"
+            registry = ModelRegistry(registry_path)
+            registry.register(
+                RegisteredModel(
+                    model_name="selected_model",
+                    target_name="home_possession",
+                    task_type="regression",
+                    version="v1",
+                    artifact_path="/tmp/possession.joblib",
+                    metrics={"r2": 0.66},
+                )
+            )
+            registry.withdraw(
+                "home_possession", reason="ESPN license, confirmed 2026-08-20"
+            )
+
+            archive_path = registry_path.with_name("registry_withdrawn.json")
+            self.assertTrue(archive_path.exists())
+            archive = json.loads(archive_path.read_text(encoding="utf-8"))
+            self.assertIn("home_possession", archive)
+            self.assertEqual(len(archive["home_possession"]), 1)
+            record = archive["home_possession"][0]
+            self.assertEqual(record["reason"], "ESPN license, confirmed 2026-08-20")
+            self.assertEqual(
+                record["entries"][0]["artifact_path"], "/tmp/possession.joblib"
+            )
+
+    def test_withdraw_on_unregistered_target_is_a_safe_no_op(self) -> None:
+        """Withdrawing a target with no entries must not raise or create an archive."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry_path = Path(temp_dir) / "registry.json"
+            registry = ModelRegistry(registry_path)
+            withdrawn = registry.withdraw("never_trained", reason="n/a")
+            self.assertEqual(withdrawn, [])
+            self.assertFalse(registry_path.with_name("registry_withdrawn.json").exists())
 
 
 if __name__ == "__main__":

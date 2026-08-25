@@ -112,12 +112,19 @@ class PredictionResponse(BaseModel):
     goals: dict[str, float]
     btts: float
     over_under: dict[str, float]
-    corners: dict[str, float]
-    cards: dict[str, float]
-    shots: dict[str, float]
-    shots_on_target: dict[str, float]
+    # None (not a flat-default dict) when no trained model is registered for
+    # this target -- e.g. corners/cards/shots/shots_on_target/possession
+    # were withdrawn 2026-08-20 (ESPN-sourced training data confirmed
+    # FORBIDDEN under Disney's Terms of Use, see
+    # database/import_records.py). A constant number that never varies by
+    # team or match reads as a real prediction to an API consumer; omitting
+    # the field is the honest signal that there isn't one.
+    corners: dict[str, float] | None = None
+    cards: dict[str, float] | None = None
+    shots: dict[str, float] | None = None
+    shots_on_target: dict[str, float] | None = None
     xg: dict[str, float]
-    possession: dict[str, float]
+    possession: dict[str, float] | None = None
     match_context: MatchContext = Field(default_factory=MatchContext)
 
     @field_validator(
@@ -132,8 +139,10 @@ class PredictionResponse(BaseModel):
         "possession",
     )
     @classmethod
-    def validate_non_empty_mapping(cls, value: dict[str, Any]) -> dict[str, Any]:
-        """Ensure response mappings are populated."""
-        if not value:
+    def validate_non_empty_mapping(
+        cls, value: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Ensure a provided response mapping is populated -- None itself is allowed."""
+        if value is not None and not value:
             raise ValueError("Response mapping cannot be empty.")
         return value
