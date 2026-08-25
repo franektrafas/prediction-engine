@@ -20,6 +20,7 @@ import math
 import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # CONFIRMED REAL (2026-08-05): `streamlit run football_ai/streamlit_app.py`
 # fails with `ModuleNotFoundError: No module named 'football_ai'` on a bare
@@ -52,6 +53,10 @@ import streamlit as st
 from PIL import Image
 
 from football_ai.config.settings import get_settings
+from football_ai.data.geocoding import (
+    coordinates_for_city_country,
+    coordinates_for_stadium,
+)
 from football_ai.data.io import read_table
 from football_ai.data.normalization import canonicalize_team_name
 from football_ai.insights import h2h, streaks
@@ -967,6 +972,122 @@ def _format_date_header_pl(day: date) -> str:
     return f"{_WEEKDAYS_PL[day.weekday()]}, {day.day} {month}"
 
 
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two points, in kilometres.
+
+    For the Travel Fatigue Index (see PROMPT_GEOCODING.md) -- feeds
+    `_render_travel_fatigue` below. Sanity-checked against well-known
+    reference distances before use (Warsaw-London ~1450 km, New York-Los
+    Angeles ~3936 km, both within 1 km of this formula's output) -- that
+    verifies the *formula*, not any specific coordinate this app will look
+    up, which is a separate, sourced-data concern handled entirely in the
+    geocoding module.
+    """
+    earth_radius_km = 6371.0088
+    lat1_radians, lat2_radians = math.radians(lat1), math.radians(lat2)
+    delta_lat = math.radians(lat2 - lat1)
+    delta_lon = math.radians(lon2 - lon1)
+    haversine_term = (
+        math.sin(delta_lat / 2) ** 2
+        + math.cos(lat1_radians) * math.cos(lat2_radians) * math.sin(delta_lon / 2) ** 2
+    )
+    return 2 * earth_radius_km * math.asin(math.sqrt(haversine_term))
+
+
+def _timezone_offset_change_hours(
+    origin_tz: str, destination_tz: str, as_of: pd.Timestamp
+) -> float:
+    """Real UTC-offset delta between two IANA zones on a given date.
+
+    Computed at `as_of` specifically, not from a fixed offset table -- the
+    real gap between two zones can change across the year wherever one
+    observes DST and the other doesn't (or they switch on different dates),
+    so the correct answer depends on which date is actually being asked
+    about.
+    """
+    moment = as_of.tz_localize(None).to_pydatetime()
+    origin_offset = ZoneInfo(origin_tz).utcoffset(moment)
+    destination_offset = ZoneInfo(destination_tz).utcoffset(moment)
+    if origin_offset is None or destination_offset is None:
+        return 0.0
+    return (destination_offset - origin_offset).total_seconds() / 3600.0
+
+
+def _render_travel_fatigue(
+    home: str, away: str, match_date: date, venue: str | None
+) -> None:
+    """Distance/rest/timezone context ahead of kickoff -- never a model feature.
+
+    Explicitly NOT merged into `features/builder.py`/the training frame
+    (see `PROMPT_ZAMKNIECIE_WATKOW.md`'s "Twarde zasady, które zostają") --
+    unlike the Club Cohesion Index, this stays a log/insight-layer read, not
+    a verified engineered feature: it's a per-fixture geocoding lookup with
+    no historical backfill, so a model could never see it consistently
+    across training rows anyway. Shows nothing it can't back with real
+    geocoded data -- no venue string for this fixture, no resolvable
+    coordinates for the venue, no prior match for a team, or an
+    unresolvable city/country on that prior match, each just drop that team
+    (or the whole section) rather than guessing a distance.
+    """
+    if not venue:
+        return
+    venue_coordinates = coordinates_for_stadium(venue)
+    if venue_coordinates is None:
+        return
+    venue_lat, venue_lon, venue_tz = venue_coordinates
+
+    as_of = pd.Timestamp(match_date, tz="UTC")
+    rows: list[dict[str, object]] = []
+    for team in (home, away):
+        form = _cached_recent_form(team, as_of.isoformat())
+        if form.empty:
+            continue
+        last_match = form.iloc[-1]
+        last_city = last_match.get("city")
+        last_country = last_match.get("country")
+        if pd.isna(last_city) or pd.isna(last_country):
+            continue
+        origin = coordinates_for_city_country(str(last_city), str(last_country))
+        if origin is None:
+            continue
+        origin_lat, origin_lon, origin_tz = origin
+        row: dict[str, object] = {
+            "team": nominative_pl(team),
+            "distance_km": _haversine_km(origin_lat, origin_lon, venue_lat, venue_lon),
+            "rest_days": _current_rest_days(form, as_of),
+        }
+        if origin_tz != venue_tz:
+            row["timezone_change_hours"] = _timezone_offset_change_hours(
+                origin_tz, venue_tz, as_of
+            )
+        rows.append(row)
+
+    if not rows:
+        return
+
+    with st.container(border=True):
+        st.subheader("Zmęczenie podróżą")
+        st.caption(
+            "Kontekst przedmeczowy, nie cecha modelu — dystans od miejsca "
+            "poprzedniego meczu do miejsca tego meczu, liczony po linii "
+            "prostej (geodezyjnie) na podstawie realnych, geokodowanych "
+            "lokalizacji."
+        )
+        columns = st.columns(len(rows))
+        for column, row in zip(columns, rows, strict=True):
+            with column:
+                st.metric(str(row["team"]), f"{row['distance_km']:.0f} km")
+                details = []
+                if row["rest_days"] is not None:
+                    details.append(f"odpoczynek: {row['rest_days']:.0f} dni")
+                if "timezone_change_hours" in row:
+                    details.append(
+                        f"zmiana strefy: {row['timezone_change_hours']:+.0f} h"
+                    )
+                if details:
+                    st.caption(" · ".join(details))
+
+
 def _relative_luminance(hex_color: str) -> float:
     """WCAG relative luminance of a `#rrggbb` colour, for contrast-ratio math."""
 
@@ -1537,6 +1658,79 @@ def _render_head_to_head(home: str, away: str, as_of: pd.Timestamp) -> None:
     )
 
 
+def _current_win_loss_streak(form: pd.DataFrame) -> tuple[int, int]:
+    """Current win/loss streak entering the next match.
+
+    Same definition `features.builder._win_loss_streaks_for_team` trains the
+    model's own `win_streak`/`loss_streak` features on -- consecutive
+    same-sign goal differences, reset by a draw -- computed independently
+    here (not imported from `features/`) rather than reused, because this
+    file's own architecture is presentation-only and never reaches into the
+    engine (see module docstring). `form` already only holds matches
+    strictly before the target date (`insights.streaks.team_matches`'s own
+    contract), so summing over all of it is exactly the shifted, leak-safe
+    value a training row on that date would have seen -- not a different
+    metric borrowing the same name.
+    """
+    win_streak = 0
+    loss_streak = 0
+    for _, row in form.iterrows():
+        difference = row["goals_for"] - row["goals_against"]
+        if difference > 0:
+            win_streak += 1
+            loss_streak = 0
+        elif difference < 0:
+            loss_streak += 1
+            win_streak = 0
+        else:
+            win_streak = 0
+            loss_streak = 0
+    return win_streak, loss_streak
+
+
+def _current_rest_days(form: pd.DataFrame, as_of: pd.Timestamp) -> float | None:
+    """Days since the team's last known match -- same definition as `_add_recency_features`.
+
+    `None` (not the engine's 14.0 imputation default) when there's no prior
+    match at all -- that fallback exists to keep a training row numeric for
+    a model that can't accept NaN, not to be asserted here as a real fact to
+    a reader who has no such constraint.
+    """
+    if form.empty:
+        return None
+    last_match_date = pd.Timestamp(form.iloc[-1]["match_date"])
+    return (as_of - last_match_date).total_seconds() / 86400.0
+
+
+def _render_model_signals(team: str, as_of: pd.Timestamp, form: pd.DataFrame) -> None:
+    """Real, currently-used model inputs for one team -- Elo, rest, current streak.
+
+    Deliberately the opposite case from `_render_match_context` (live
+    context the model provably does NOT use, e.g. lineup value/injuries):
+    every number shown here genuinely feeds the trained model, so it
+    carries no "does not enter the model" disclaimer -- adding one here
+    would be just as dishonest as omitting one there. Silently drops any
+    single part it can't compute (no Elo for this team, no prior match for
+    rest days, no active streak) instead of showing a placeholder.
+    """
+    parts: list[str] = []
+    elo = _load_elo_ratings().get(canonicalize_team_name(team))
+    if elo is not None:
+        parts.append(f"Elo: {elo:.0f}")
+    rest_days = _current_rest_days(form, as_of)
+    if rest_days is not None:
+        parts.append(f"odpoczynek: {rest_days:.0f} dni")
+    win_streak, loss_streak = _current_win_loss_streak(form)
+    if win_streak > 0:
+        word = _plural_pl(win_streak, "zwycięstwo", "zwycięstwa", "zwycięstw")
+        parts.append(f"seria: {win_streak} {word}")
+    elif loss_streak > 0:
+        word = _plural_pl(loss_streak, "porażka", "porażki", "porażek")
+        parts.append(f"seria: {loss_streak} {word}")
+    if parts:
+        st.caption(" · ".join(parts) + " — realne cechy modelu, nie dodatek")
+
+
 def _render_team_form(team: str, as_of: pd.Timestamp) -> None:
     """Last ten matches as a metrics heat map and attendance chart.
 
@@ -1549,6 +1743,7 @@ def _render_team_form(team: str, as_of: pd.Timestamp) -> None:
         st.caption("Brak meczów w zbiorze historycznym przed tą datą.")
         return
 
+    _render_model_signals(team, as_of, form)
     st.plotly_chart(_team_metric_heatmap_figure(form), width="stretch")
     st.caption(
         "Intensywność koloru rośnie wraz z wartością, osobno w każdym "
@@ -1751,6 +1946,38 @@ def _render_diagnostics(prediction: PredictionResponse) -> None:
         st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
+_MATCH_STAT_LABELS: tuple[tuple[str, str], ...] = (
+    ("corners", "Rzuty rożne"),
+    ("cards", "Żółte kartki"),
+    ("shots", "Strzały"),
+    ("shots_on_target", "Strzały celne"),
+    ("possession", "Posiadanie (%)"),
+)
+
+
+def _match_stat_rows(prediction: PredictionResponse) -> list[tuple[str, float, float]]:
+    """Home/away stat pairs actually available for this prediction.
+
+    `corners`/`cards`/`shots`/`shots_on_target`/`possession` are `None`
+    on `PredictionResponse` whenever no model is registered for that target
+    (see `predictions.service._predict_regression_optional`) -- e.g. the 10
+    ESPN-derived stat models withdrawn 2026-08-20 for a confirmed Disney ToU
+    violation (see `models/registry.py`'s `withdraw()` and
+    `import_records.py`'s module docstring). Skips any stat that's `None`
+    rather than indexing into it, per the explicit "prefer nothing over a
+    flat fabricated value" decision -- shared by both the live Streamlit
+    view and the PDF export so neither can silently drift out of sync with
+    what the API actually returns.
+    """
+    rows: list[tuple[str, float, float]] = []
+    for field_name, label in _MATCH_STAT_LABELS:
+        pair = getattr(prediction, field_name)
+        if pair is None:
+            continue
+        rows.append((label, pair["home"], pair["away"]))
+    return rows
+
+
 def _render_match_context(prediction: PredictionResponse) -> None:
     """Live context the model provably ignores -- labelled, kept off model numbers."""
     context = prediction.match_context.model_dump()
@@ -1836,6 +2063,37 @@ def _pdf_outcome_chart_png(
     return _matplotlib_png_bytes(figure)
 
 
+def _pdf_probability_chart_png(labels: list[str], values: list[float]) -> bytes:
+    """Ranked N-team qualification-probability bars, rendered for the PDF.
+
+    Generalizes `_pdf_outcome_chart_png` from a fixed three-category 1X2
+    chart to an arbitrary number of teams -- same single-colour bar family
+    as the on-screen `_probability_chart` (`_HOME_COLOUR` for every bar,
+    since there's no home/away/draw split for a qualification race), same
+    "value written past the bar end" label style as every other PDF chart
+    in this module.
+    """
+    figure, axis = plt.subplots(
+        figsize=(6.3, 0.5 * len(labels) + 1), dpi=200
+    )
+    bars = axis.barh(labels, values, color=_HOME_COLOUR)
+    axis.set_xlim(0, 1.15)
+    axis.invert_yaxis()
+    for bar, value in zip(bars, values, strict=True):
+        axis.text(
+            value + 0.02,
+            bar.get_y() + bar.get_height() / 2,
+            f"{value:.0%}",
+            va="center",
+            fontsize=10,
+        )
+    axis.set_xticks([])
+    for spine in ("top", "right", "bottom"):
+        axis.spines[spine].set_visible(False)
+    figure.tight_layout()
+    return _matplotlib_png_bytes(figure)
+
+
 def _pdf_score_grid_png(
     home_label: str, away_label: str, matrix: list[list[float]]
 ) -> bytes:
@@ -1876,6 +2134,52 @@ def _pdf_score_grid_png(
     axis.set_ylabel(f"Bramki: {home_label}")
     axis.xaxis.set_label_position("top")
     axis.xaxis.tick_top()
+    axis.tick_params(length=0)
+    for spine in axis.spines.values():
+        spine.set_visible(False)
+    figure.tight_layout()
+    return _matplotlib_png_bytes(figure)
+
+
+def _pdf_position_heatmap_png(
+    team_labels: list[str], position_labels: list[str], matrix: list[list[float]]
+) -> bytes:
+    """Final-position probability heat map (teams x finishing places), for the PDF.
+
+    Same logic as `_pdf_score_grid_png` -- same gold colormap
+    (`_METRIC_HEATMAP_COLORSCALE`), same peak-normalized cell shading, same
+    `_readable_cell_text_color` contrast pick -- just with the axes swapped
+    for teams x final position instead of home goals x away goals, matching
+    the on-screen `_heatmap_figure` used for "Gdzie kończy każda drużyna".
+    """
+    peak = max((value for row in matrix for value in row), default=0.0)
+    colormap = matplotlib.colors.LinearSegmentedColormap.from_list(
+        "statsdesk_gold", [stop for _, stop in _METRIC_HEATMAP_COLORSCALE]
+    )
+    figure, axis = plt.subplots(
+        figsize=(0.85 * len(position_labels) + 2, 0.6 * len(team_labels) + 1.6),
+        dpi=200,
+    )
+    axis.imshow(matrix, cmap=colormap, vmin=0, vmax=peak or 1.0, aspect="auto")
+    for row_index, row in enumerate(matrix):
+        for column_index, value in enumerate(row):
+            if value < 0.005:
+                continue
+            normalized = value / peak if peak > 0 else 0.0
+            cell_color = _metric_heatmap_cell_color(normalized)
+            axis.text(
+                column_index,
+                row_index,
+                f"{value:.0%}",
+                ha="center",
+                va="center",
+                fontsize=9,
+                color=_readable_cell_text_color(cell_color),
+            )
+    axis.set_xticks(range(len(position_labels)))
+    axis.set_xticklabels(position_labels, fontsize=8)
+    axis.set_yticks(range(len(team_labels)))
+    axis.set_yticklabels(team_labels, fontsize=9)
     axis.tick_params(length=0)
     for spine in axis.spines.values():
         spine.set_visible(False)
@@ -2091,36 +2395,20 @@ def _build_analysis_pdf(
     render_form_table(away_label, away_form_rows)
 
     write("Statystyki meczowe (prognoza)", size=12, style="B", gap=7)
-    embed_chart(
-        _pdf_team_comparison_png(
-            home_label,
-            away_label,
-            [
-                (
-                    "Rzuty rożne",
-                    prediction.corners["home"],
-                    prediction.corners["away"],
-                ),
-                (
-                    "Żółte kartki",
-                    prediction.cards["home"],
-                    prediction.cards["away"],
-                ),
-                ("Strzały", prediction.shots["home"], prediction.shots["away"]),
-                (
-                    "Strzały celne",
-                    prediction.shots_on_target["home"],
-                    prediction.shots_on_target["away"],
-                ),
-                (
-                    "Posiadanie (%)",
-                    prediction.possession["home"],
-                    prediction.possession["away"],
-                ),
-            ],
-        ),
-        width=usable_width,
-    )
+    stat_rows = _match_stat_rows(prediction)
+    if stat_rows:
+        embed_chart(
+            _pdf_team_comparison_png(home_label, away_label, stat_rows),
+            width=usable_width,
+        )
+    else:
+        write(
+            "Brak dostępnych statystyk (rzuty rożne, kartki, strzały, "
+            "posiadanie) -- źródło tych danych zostało wycofane z produkcji "
+            "z powodu ograniczeń licencyjnych.",
+            size=9,
+        )
+        document.ln(3)
 
     write("Nietypowe fakty", size=12, style="B", gap=7)
     if facts:
@@ -2143,6 +2431,149 @@ def _build_analysis_pdf(
         f"Wygenerowano {generated_at} przez {_APP_NAME}. Liczby pochodzą z modelu "
         "statystycznego uczonego na historycznych wynikach — nie są kursem ani "
         "zakładem bukmacherskim.",
+        size=7.5,
+        gap=4,
+    )
+    return bytes(document.output())
+
+
+def _build_outlook_pdf(
+    division: str,
+    group: str,
+    season: str,
+    standings_frame: pd.DataFrame,
+    probability_labels: list[str],
+    probability_values: list[float],
+    position_team_labels: list[str],
+    position_labels: list[str],
+    position_matrix: list[list[float]],
+    whatif: dict[str, object] | None,
+) -> bytes:
+    """PDF of the "Perspektywy grupy" tab, mirroring `_build_analysis_pdf`'s pattern.
+
+    Same `_BrandedPDF` class (watermark on every page via `footer()`), same
+    DejaVu font, same `write()`/`embed_chart()` helpers -- deliberately not
+    reimplemented, just re-derived per call, since `_build_analysis_pdf`
+    itself keeps them as function-local closures rather than module-level
+    helpers.
+
+    `standings_frame` is rendered as a real fpdf2 table
+    (`document.table(...)`), not an image, mirroring `render_form_table`'s
+    approach in `_build_analysis_pdf` -- an editor/reader needs to select
+    and copy numbers out of it, which a rasterized table would prevent.
+    """
+    from fpdf import FPDF
+    from fpdf.fonts import FontFace
+
+    class _BrandedPDF(FPDF):
+        """A4 document that stamps the StatsDesk watermark on every page."""
+
+        def footer(self) -> None:
+            """Draw the light-background watermark just above the bottom margin."""
+            if not _WATERMARK_LIGHT.exists():
+                return
+            self.set_y(-18)
+            self.image(str(_WATERMARK_LIGHT), x=self.w - 46, w=32)
+
+    document = _BrandedPDF(format="A4")
+    document.set_auto_page_break(auto=True, margin=22)
+    document.add_page()
+    font_path = str(_unicode_font_path())
+    document.add_font("DejaVu", "", font_path)
+    document.add_font(
+        "DejaVu", "B", str(font_path).replace("DejaVuSans", "DejaVuSans-Bold")
+    )
+
+    def write(text: str, size: float = 10, style: str = "", gap: float = 5.5) -> None:
+        document.set_font("DejaVu", style, size)
+        document.multi_cell(0, gap, text, new_x="LMARGIN", new_y="NEXT")
+
+    usable_width = document.w - document.l_margin - document.r_margin
+
+    def embed_chart(png_bytes: bytes, width: float, gap: float = 3) -> None:
+        """Place a chart image at the left margin, then advance past it."""
+        from io import BytesIO
+
+        document.image(BytesIO(png_bytes), x=document.l_margin, w=width)
+        document.ln(gap)
+
+    def render_table(frame: pd.DataFrame) -> None:
+        """A pandas frame as a real fpdf2 table -- same pattern as `render_form_table`."""
+        table_rows = [list(frame.columns)] + [
+            ["" if pd.isna(value) else str(value) for value in record]
+            for record in frame.itertuples(index=False)
+        ]
+        document.set_font("DejaVu", "", 8)
+        with document.table(
+            table_rows,
+            text_align="LEFT",
+            first_row_as_headings=True,
+            headings_style=FontFace(family="DejaVu", emphasis="B", size_pt=8),
+            line_height=5,
+        ):
+            pass
+        document.ln(3)
+
+    if _LOCKUP_LIGHT.exists():
+        document.image(str(_LOCKUP_LIGHT), x=document.l_margin, y=10, w=52)
+        document.set_y(28)
+    else:
+        write(_APP_NAME, size=9, style="B", gap=5)
+    write(f"Dywizja {division}, grupa {group}", size=19, style="B", gap=10)
+    write(f"Sezon {season}", size=10, gap=5.5)
+    generated_at = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+    write(f"Wygenerowano {generated_at}", size=9, gap=5)
+    document.ln(3)
+
+    write("Aktualna tabela", size=12, style="B", gap=7)
+    render_table(standings_frame)
+    write(
+        "⚠️ Uproszczenie: przy równej liczbie punktów tabela rozstrzyga kolejność "
+        "wyłącznie przez bilans bramek i bramki strzelone. Regulaminy UEFA/FIFA "
+        "uwzględniają najpierw bezpośrednie spotkania — w ściśle remisowych "
+        "przypadkach kolejność może się różnić.",
+        size=8,
+        gap=4.5,
+    )
+    document.ln(3)
+
+    write("Prawdopodobieństwo awansu", size=12, style="B", gap=7)
+    embed_chart(
+        _pdf_probability_chart_png(probability_labels, probability_values),
+        width=usable_width,
+    )
+    document.ln(2)
+
+    write("Gdzie kończy każda drużyna", size=12, style="B", gap=7)
+    embed_chart(
+        _pdf_position_heatmap_png(
+            position_team_labels, position_labels, position_matrix
+        ),
+        width=min(usable_width, 150),
+    )
+    write(
+        "Każdy wiersz sumuje się do 100% — drużyna kończy dokładnie na jednym miejscu.",
+        size=8,
+        gap=4.5,
+    )
+
+    if whatif is not None:
+        document.ln(3)
+        write("Scenariusz „co jeśli”", size=12, style="B", gap=7)
+        write(
+            f"Mecz: {whatif['match_label']}    Ustalony wynik: "
+            f"{whatif['home_label']} {whatif['home_goals']}:{whatif['away_goals']} "
+            f"{whatif['away_label']}",
+            size=9,
+            gap=5,
+        )
+        render_table(whatif["comparison_frame"])
+
+    document.ln(4)
+    write(
+        f"Wygenerowano przez {_APP_NAME}. Procenty pochodzą z symulacji Monte "
+        "Carlo opartej na prognozach modelu statystycznego dla pozostałych "
+        "meczów grupy — nie są kursem ani zakładem bukmacherskim.",
         size=7.5,
         gap=4,
     )
@@ -2517,36 +2948,19 @@ def _render_match_preview_tab() -> None:
 
     with st.container(border=True):
         st.subheader("Statystyki meczowe")
-        st.plotly_chart(
-            _team_comparison_chart(
-                home_label,
-                away_label,
-                [
-                    (
-                        "Rzuty rożne",
-                        prediction.corners["home"],
-                        prediction.corners["away"],
-                    ),
-                    (
-                        "Żółte kartki",
-                        prediction.cards["home"],
-                        prediction.cards["away"],
-                    ),
-                    ("Strzały", prediction.shots["home"], prediction.shots["away"]),
-                    (
-                        "Strzały celne",
-                        prediction.shots_on_target["home"],
-                        prediction.shots_on_target["away"],
-                    ),
-                    (
-                        "Posiadanie (%)",
-                        prediction.possession["home"],
-                        prediction.possession["away"],
-                    ),
-                ],
-            ),
-            width="stretch",
-        )
+        stat_rows = _match_stat_rows(prediction)
+        if stat_rows:
+            st.plotly_chart(
+                _team_comparison_chart(home_label, away_label, stat_rows),
+                width="stretch",
+            )
+        else:
+            st.caption(
+                "Brak dostępnych statystyk meczowych (rzuty rożne, kartki, "
+                "strzały, posiadanie) — źródło tych danych zostało wycofane "
+                "z produkcji z powodu ograniczeń licencyjnych; silnik nie "
+                "zgaduje wartości, których nie ma czym potwierdzić."
+            )
 
     # Head-to-head and streak facts already appear as structured context
     # above, so they're dropped here rather than repeated -- what's left is
@@ -2561,6 +2975,7 @@ def _render_match_preview_tab() -> None:
         _render_facts(trivia)
 
     _render_match_context(prediction)
+    _render_travel_fatigue(home, away, match_date, venue)
     _render_group_outlook_link(home, away, tournament)
     _render_diagnostics(prediction)
 
@@ -3033,16 +3448,61 @@ def _render_competition_outlook_tab() -> None:
             "dokładnie na jednym miejscu."
         )
 
-    _render_what_if(simulation_input, int(n_qualifying_spots), int(n_simulations))
+    whatif_data = _render_what_if(
+        simulation_input, int(n_qualifying_spots), int(n_simulations)
+    )
+
+    with st.container(border=True):
+        st.subheader("Eksport")
+        try:
+            probability_labels = [nominative_pl(team) for team, _ in ranked]
+            probability_values = [value for _, value in ranked]
+            pdf_bytes = _build_outlook_pdf(
+                division=stored["division"],
+                group=stored["group"],
+                season=season,
+                standings_frame=standings_frame,
+                probability_labels=probability_labels,
+                probability_values=probability_values,
+                position_team_labels=[nominative_pl(team) for team in ordered_teams],
+                position_labels=[
+                    f"{place}. miejsce" for place in range(1, len(ordered_teams) + 1)
+                ],
+                position_matrix=matrix,
+                whatif=whatif_data,
+            )
+        except Exception:
+            st.caption("PDF niedostępny")
+        else:
+            file_name = (
+                f"{stored['division']}-{stored['group']}-{season}.pdf"
+            ).replace(" ", "_")
+            st.download_button(
+                "Eksportuj do PDF",
+                data=pdf_bytes,
+                file_name=file_name,
+                mime="application/pdf",
+                width="stretch",
+                key="outlook_pdf_export",
+            )
 
 
 def _render_what_if(
     simulation_input: SimulationInput, n_qualifying_spots: int, n_simulations: int
-) -> None:
-    """Fix one remaining match and show qualification odds before vs. after."""
+) -> dict[str, object] | None:
+    """Fix one remaining match and show qualification odds before vs. after.
+
+    Returns the same match/goals/comparison data just rendered on screen (or
+    `None` when there are no remaining matches to build a scenario from) so
+    `_render_competition_outlook_tab`'s PDF export can reuse it verbatim
+    instead of recomputing the Monte Carlo scenario a second time -- and so
+    the PDF only ever gets a "co jeśli" section under the exact same
+    condition the screen does, never fabricated for a group with nothing
+    left to play.
+    """
     remaining = simulation_input.remaining_matches
     if not remaining:
-        return
+        return None
 
     with st.container(border=True):
         st.subheader("Scenariusz „co jeśli”")
@@ -3116,6 +3576,20 @@ def _render_what_if(
             width="stretch",
             hide_index=True,
         )
+
+    comparison_display = comparison.assign(
+        Przed=comparison["Przed"].map(lambda value: f"{value:.0%}"),
+        Po=comparison["Po"].map(lambda value: f"{value:.0%}"),
+        Zmiana=comparison["Zmiana"].map(lambda value: f"{value:+.1%}"),
+    )
+    return {
+        "match_label": _match_label(match_index),
+        "home_label": nominative_pl(fixed_match.home_team),
+        "home_goals": int(home_goals),
+        "away_label": nominative_pl(fixed_match.away_team),
+        "away_goals": int(away_goals),
+        "comparison_frame": comparison_display,
+    }
 
 
 # --------------------------------------------------------------------------
