@@ -194,10 +194,32 @@ Dodać: klucz API, wersjonowanie ścieżki, zapis odpowiedzi do istniejącej tab
 | Nie robimy | Dlaczego |
 |---|---|
 | Top 5 lig i Liga Mistrzów | Najpierw jedna ścieżka pionowa. Replikacja na kolejne rozgrywki jest tania **po** zbudowaniu maszynerii, droga przed |
-| Dostrajanie modelu, nowe cechy | Marginalna wartość biznesowa, wysoki koszt czasu |
 | GNN | Brak ścieżki do przychodu przy jednoosobowym zespole |
 | LLM do generowania faktów | Ryzyko błędu rzeczowego publikowanego pod cudzym nazwiskiem |
-| Kolejne źródła danych | martj42 wystarczy do udowodnienia całej ścieżki |
+
+**Uwaga (20 sierpnia 2026):** decyzja "martj42 wystarczy, nie dodajemy kolejnych źródeł" i
+"nie dostrajamy modelu, nie dodajemy cech" są **uchylone** — pionowa ścieżka (Kroki 1-5) jest
+w praktyce zbudowana i zweryfikowana testami (patrz historia commitów), więc kolejny sensowny
+krok to rozbudowa, nie utrzymywanie status quo. Świadomie otwieramy się na nowe źródła
+statystyk (np. footballsquads.co.uk — realne, ustrukturyzowane składy turniejowe od 1950/1980
+do dziś, potwierdzone as-of 2026-08-20; rsssf.org jako katalog/archiwum, nie osobne dane ponad
+martj42; estadisticasdefutbol.net obecnie nieosiągalny, sprawdzone realnie przeglądarką) i na
+nowe cechy modelu pod nadchodzący pełny retrening — pod warunkiem tej samej rygorystyczności co
+reszta projektu: dane realne i cytowalne, nigdy zgadywane z pamięci modelu (patrz
+`PROMPT_GEOCODING.md`), i żadnej zmiany w `features/builder.py` bez jawnej decyzji, tak jak przy
+błędzie neutral-venue.
+
+**Uwaga (25 sierpnia 2026):** decyzja o statystykach zespołowych (shots/corners/cards/possession)
+podjęta — zostajemy przy obecnym pułapie danych. Nie kupujemy płatnego planu api-football.com pod
+te statystyki, ani jako stała subskrypcja, ani jako jednorazowy zakup-ściągnij-anuluj: sprawdzone
+realnie w regulaminie (api-football.com/terms, stan 2026-08-25) — dostawca nie udziela licencji na
+publikację/zatrzymanie danych po zakończeniu subskrypcji, tylko na dostęp w jej trakcie, więc status
+prawny danych zachowanych po anulowaniu jest niejasny, a projekt mierzy w komercyjne B2B. Retrening
+idzie na tym, co realnie jest w bazie dziś plus cokolwiek doda Data Engine (footballsquads,
+provenance, quality layer) — bez nowego źródła stat zespołowych. Przed samym retreningiem nadal
+trzeba: (1) zaplanowane odświeżanie wyników meczów (obecnie brak automatyzacji — dane stały od
+2 sierpnia, co ujawnił żywy przykład ASEAN Cup), (2) gate neutral-venue w `features/builder.py`,
+(3) realny raport z `data_quality/report.py` — nikt go jeszcze nie odpalił.
 
 ---
 
