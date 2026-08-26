@@ -179,6 +179,96 @@ class FeatureBuilderTestCase(unittest.TestCase):
         self.assertEqual(fourth_match["home_goals_for_mean_3_venue"], 2.0)
 
 
+class NeutralVenueFullPipelineSymmetryTestCase(unittest.TestCase):
+    """Full build_features()-level regression test for PROMPT_NAPRAWA_PRZECIEKU_HOME.md.
+
+    `test_neutral_venue_does_not_contaminate_true_home_rolling` passed the
+    whole time the real leak was live in production -- it only exercises
+    `_add_rolling_features`'s venue split, not the full feature set. The
+    real bug (found 2026-08-26 via a live-service diagnostic) was `is_home`
+    itself surviving `_wide_merge` unexcluded: a purely positional sheet
+    flag, reaching the model as a direct, ungated "am I the home-labeled
+    side" signal even on a neutral match. This test instead builds the
+    *complete* numeric feature set for the same neutral match under both
+    home/away labelings and asserts every column mirrors -- so any future
+    leak of this general shape (a new column that forgets to respect
+    neutral-venue symmetry) fails loudly here, not just in production.
+    """
+
+    _PRIOR_MATCHES = [
+        {
+            "match_date": "2024-01-01",
+            "home_team_name": "TeamA",
+            "away_team_name": "TeamC",
+            "home_score": 2,
+            "away_score": 0,
+            "neutral_venue": False,
+        },
+        {
+            "match_date": "2024-01-05",
+            "home_team_name": "TeamB",
+            "away_team_name": "TeamD",
+            "home_score": 1,
+            "away_score": 1,
+            "neutral_venue": False,
+        },
+    ]
+
+    def _neutral_match_feature_row(
+        self, home: str, away: str, home_score: int, away_score: int
+    ):
+        matches = pd.DataFrame(
+            [
+                *self._PRIOR_MATCHES,
+                {
+                    "match_date": "2024-02-01",
+                    "home_team_name": home,
+                    "away_team_name": away,
+                    "home_score": home_score,
+                    "away_score": away_score,
+                    "neutral_venue": True,
+                },
+            ]
+        )
+        feature_result = build_features(matches)
+        return feature_result.frame.iloc[-1], feature_result.numeric_columns
+
+    def test_every_numeric_feature_mirrors_across_a_home_away_relabel(self) -> None:
+        """Same real neutral match, relabelled -- every home_X must equal away_X."""
+        original_row, numeric_columns = self._neutral_match_feature_row(
+            "TeamA", "TeamB", 2, 1
+        )
+        # Same real event, TeamB now the sheet-labelled home side -- score swapped
+        # to match (TeamB scored 1, TeamA scored 2, same as above).
+        swapped_row, _ = self._neutral_match_feature_row("TeamB", "TeamA", 1, 2)
+
+        mismatches = []
+        for column in numeric_columns:
+            if not (column.startswith("home_") or column.startswith("away_")):
+                continue
+            mirror_column = (
+                "away_" + column[len("home_"):] if column.startswith("home_")
+                else "home_" + column[len("away_"):]
+            )
+            if mirror_column not in numeric_columns:
+                continue
+            value, mirror_value = original_row[column], swapped_row[mirror_column]
+            if pd.isna(value) and pd.isna(mirror_value):
+                continue
+            both_known = not pd.isna(value) and not pd.isna(mirror_value)
+            difference = abs(float(value) - float(mirror_value)) if both_known else None
+            close_enough = difference is not None and difference <= 1e-9
+            if not close_enough:
+                mismatches.append((column, value, mirror_column, mirror_value))
+
+        self.assertEqual(
+            mismatches,
+            [],
+            f"{len(mismatches)} numeric feature column(s) break home/away symmetry "
+            f"on a neutral-venue match: {mismatches}",
+        )
+
+
 class MergeSquadIndicesTestCase(unittest.TestCase):
     """Regression tests for PROMPT_ZAMKNIECIE_WATKOW.md item 2's real gap.
 

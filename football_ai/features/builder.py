@@ -800,6 +800,29 @@ def build_features(
             "home_travel_distance_km",
             "away_travel_distance_km",
             "travel_distance_diff",
+            # CONFIRMED REAL LEAK, structurally different from the
+            # neutral-venue rolling-feature bug fixed above (found
+            # 2026-08-26 via PROMPT_NAPRAWA_PRZECIEKU_HOME.md's diagnostic,
+            # after that fix still left the trained model reacting to
+            # which side is "home" on a neutral-venue match). `is_home` is
+            # a purely positional flag from the source sheet (1 for
+            # whichever side `home_team_name` names, 0 otherwise) --
+            # `_add_rolling_features`'s `effective_is_home` gate only
+            # governs how *rolling aggregates* are bucketed; it never
+            # touches this raw per-row value, which survives `_wide_merge`
+            # unexcluded and reaches the model as a direct, ungated
+            # "am I the sheet-labeled home side" signal -- on a neutral
+            # match this is 1/0 exactly as if it were a real home match.
+            # Genuine home advantage is already captured properly by the
+            # venue-split rolling features and `home_is_tournament_host`/
+            # `away_is_tournament_host` (both `neutral_venue`-aware); this
+            # raw flag adds nothing legitimate on top of those, only the
+            # leak. Excluded, not gated -- `_wide_merge`'s own use of raw
+            # `is_home` for deciding which prefix a row's stats land under
+            # is unrelated and must not change (see module's own hard
+            # rule).
+            "home_is_home",
+            "away_is_home",
         ]
     )
     # Raw per-match outcome statistics (as opposed to their rolling/historical
