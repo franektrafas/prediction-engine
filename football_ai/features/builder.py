@@ -726,9 +726,29 @@ def build_features(
     feature_frame = _add_match_importance_tier(feature_frame)
     feature_frame = _add_tournament_host_flag(feature_frame)
 
+    # `home_team_name`/`away_team_name` used to be here too. CONFIRMED REAL
+    # LEAK via direct SHAP inspection (2026-08-27,
+    # PROMPT_USUNIECIE_TOZSAMOSCI_DRUZYNY.md): one-hot-encoded team
+    # identity gave the model a *separate* learned
+    # prior for "TeamX-as-home" vs "TeamX-as-away" -- for a historically
+    # dominant team (Germany), `away_team_name_Germany` was the single
+    # highest-|SHAP| feature in a real match_outcome prediction, ahead of
+    # every Elo/rolling feature, and it doesn't respect `neutral_venue` at
+    # all (unlike `home_is_home`, already excluded, this isn't even a
+    # positional flag -- it's the team's raw identity, so no gate on
+    # `is_home` could fix it). A more "generic" pair (Portugal/Netherlands)
+    # showed far less of this effect, confirming it tracks a specific
+    # team's historical lopsidedness, not a universal artifact.
+    # `tournament`/`country` don't carry the same risk: neither is a
+    # near-unique per-team identifier (many different away teams share the
+    # same host `country`; `tournament` is a competition name, not a team).
+    # Same-data, same-`--n-trials 10` ablation (match_outcome, LightGBM
+    # best model both times) confirmed the metric cost is small, not a
+    # hidden major signal source: accuracy 0.5842 -> 0.5766 (-0.0077),
+    # f1 0.5085 -> 0.5023 (-0.0062), both under 1 percentage point.
     categorical_columns = [
         column
-        for column in ["tournament", "country", "home_team_name", "away_team_name"]
+        for column in ["tournament", "country"]
         if column in feature_frame.columns
     ]
     excluded_columns = set(

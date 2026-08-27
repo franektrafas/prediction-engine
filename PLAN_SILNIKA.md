@@ -221,6 +221,19 @@ trzeba: (1) zaplanowane odświeżanie wyników meczów (obecnie brak automatyzac
 2 sierpnia, co ujawnił żywy przykład ASEAN Cup), (2) gate neutral-venue w `features/builder.py`,
 (3) realny raport z `data_quality/report.py` — nikt go jeszcze nie odpalił.
 
+**Uwaga (27 sierpnia 2026):** `home_team_name`/`away_team_name` usunięte z cech kategorycznych
+modelu w `features/builder.py` — potwierdzony realny przeciek (nie hipoteza): SHAP bezpośrednio
+na wytrenowanym `match_outcome` pokazał, że dla historycznie zdominowanej drużyny (Niemcy)
+one-hot `away_team_name_Germany` był pojedynczą najważniejszą cechą całej predykcji, silniejszą
+niż Elo/rolling, i nieczułą na `neutral_venue` (bo to surowa tożsamość, nie flaga pozycyjna jak
+naprawiony wcześniej `home_is_home`). Para bardziej generyczna (Portugalia/Holandia) nie
+pokazywała tego efektu w tym stopniu — potwierdza, że problem śledzi konkretną, historycznie
+jednostronną drużynę, nie jest stałym artefaktem. Duży rozjazd Elo + neutralny grunt to profil
+meczu grupowego mistrzostw świata — rdzeń tego, co silnik ma przewidywać, nie margines, stąd
+decyzja usunięcia, nie akceptacji rezydualnego obciążenia. Ablacja (`match_outcome`, ten sam
+`--n-trials 10`, ten sam podział) potwierdziła niski koszt: accuracy -0.0077, f1 -0.0062, obie
+poniżej 1 punktu procentowego — usunięcie tanie, nie utrata realnego sygnału.
+
 ---
 
 ## Kolejność w jednym zdaniu
