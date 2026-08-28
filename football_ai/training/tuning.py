@@ -94,15 +94,29 @@ def tune_model(
             scores.append(metrics[score_name])
         return float(sum(scores) / len(scores))
 
+    # CONFIRMED REAL (2026-08-28, PROMPT_FINALNY_RETRENING_I_SEED.md): with
+    # no sampler passed, optuna.create_study() defaults to an unseeded
+    # TPESampler -- the sequence of hyperparameter configurations tried is
+    # genuinely random across separate studies, unlike every base model's
+    # own `random_state=42` (see lightgbm_model.py etc.), which only makes
+    # *a given configuration* reproducible, not *which* configurations get
+    # tried. This surfaced as a real instability: the same command, run
+    # twice, gave a match_outcome home-advantage diagnostic ratio of 1.85x
+    # one run and 0.267x the next -- pure search-order noise on a rare
+    # data regime (large Elo gap + neutral venue), not a structural bug
+    # (see PROMPT_STABILNOSC_I_SUFIT_PRAWDOPODOBIENSTWA.md). `42` for
+    # consistency with the models' own fixed seed, not any special meaning.
+    sampler = optuna.samplers.TPESampler(seed=42)
     if storage_path is not None:
         study = optuna.create_study(
             direction=direction,
             study_name=f"{model.target_name}__{model.model_name}__{model.version}",
             storage=f"sqlite:///{storage_path}",
             load_if_exists=True,
+            sampler=sampler,
         )
     else:
-        study = optuna.create_study(direction=direction)
+        study = optuna.create_study(direction=direction, sampler=sampler)
 
     already_completed = sum(1 for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE)
     remaining_trials = max(0, n_trials - already_completed)

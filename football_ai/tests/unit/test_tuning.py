@@ -76,6 +76,37 @@ class TuneModelTestCase(unittest.TestCase):
             study_final = optuna.load_study(study_name="y__fast_ridge__v1", storage=f"sqlite:///{storage_path}")
             self.assertEqual(len(study_final.trials), 5)
 
+    def test_same_seed_produces_identical_trial_sequence_across_runs(self) -> None:
+        """Regression test for a real reproducibility bug (2026-08-28).
+
+        `optuna.create_study()` used to be called with no `sampler=`,
+        defaulting to an unseeded TPESampler -- unlike every base model's
+        own fixed `random_state=42` (reproducible *given* a configuration),
+        the *sequence* of configurations Optuna tried was genuinely random
+        across separate studies. This surfaced as a real instability: the
+        same training command, run twice, gave a home-advantage diagnostic
+        ratio of 1.85x one run and 0.267x the next on the same data and
+        code -- pure search-order noise, not a structural leak (see
+        PROMPT_STABILNOSC_I_SUFIT_PRAWDOPODOBIENSTWA.md). Two independent
+        in-memory studies (no shared storage/state at all) must now try
+        the exact same hyperparameters in the exact same order.
+        """
+        features, target = _synthetic_dataset()
+
+        def make_model() -> _FastRidgeModel:
+            return _FastRidgeModel(
+                model_name="fast_ridge", task_type="regression", target_name="y"
+            )
+
+        result_a = tune_model(
+            make_model(), features, target, categorical_columns=[], n_trials=3
+        )
+        result_b = tune_model(
+            make_model(), features, target, categorical_columns=[], n_trials=3
+        )
+
+        self.assertEqual(result_a, result_b)
+
     def test_different_versions_get_independent_studies(self) -> None:
         """Two versions of the same model/target must not share -- or collide on -- a study.
 
