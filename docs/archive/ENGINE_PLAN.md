@@ -2,7 +2,6 @@
 
 **Data:** 29 lipca 2026
 **Status:** decyzja podjęta, do wykonania
-**Dla kogo:** Claude Code / Codex pracujący w tym repo
 
 ---
 
