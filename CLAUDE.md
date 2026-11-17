@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current work — read this first
 
-The active plan lives in **`PLAN_SILNIKA.md`** (Polish). Read it before starting new work.
+The active plan lives in **`docs/archive/ENGINE_PLAN.md`** (Polish). Read it before starting new work.
 
 Short version: the prediction engine is considered done and is **not** the thing to improve.
 Model tuning, new features, extra leagues and the GNN scaffold are all explicitly paused.
