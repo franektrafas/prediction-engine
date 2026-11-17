@@ -1,6 +1,7 @@
-# CLAUDE.md
+# Development Guide
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file documents the project's conventions, architecture invariants, and
+current priorities for anyone working on this codebase.
 
 ## Current work — read this first
 
