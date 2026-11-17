@@ -1,274 +1,120 @@
-# Football AI
+# football_ai
 
-Modularny projekt AI do prognozowania wynikow meczow pilkarskich reprezentacji narodowych oraz statystyk meczowych. Projekt jest przygotowany pod Python 3.12, PostgreSQL, Google Colab oraz GitHub.
+A leak-safe machine-learning pipeline for predicting international football
+matches: 1X2 outcome, goals, xG, and (where licensed data allows) match
+statistics, followed by Monte Carlo simulation of group and tournament
+outcomes.
 
-## Zakres predykcji
+The emphasis is on the engineering around the model: time-aware validation,
+explicit leakage audits, provenance-tracked data, and honest handling of
+missing or unlicensed data, rather than on squeezing out the last point of
+accuracy.
 
-System obsluguje lub przygotowuje pipeline pod:
+## Example output
 
-- prawdopodobienstwo `1X2`
-- dokladny wynik
-- gole gospodarzy i gosci
-- rynki `Over/Under` 1.5, 2.5 i 3.5
-- `BTTS`
-- rzuty rozne
-- kartki
-- strzaly i strzaly celne
-- `xG`
-- posiadanie pilki
+Monte Carlo outlook for UEFA Nations League 2026-27, League B, Group 4:
+finishing-position distribution from 10,000 simulated seasons, and a
+"what if" scenario with a fixed result. Probabilities come from the trained
+models' predicted goals, sampled as Poisson scorelines (not 1X2 classes),
+because qualification is decided on goal difference.
 
-## Architektura
+<p>
+  <img src="docs/images/group-outlook-1.png" width="48%" alt="Qualification probabilities">
+  <img src="docs/images/group-outlook-2.png" width="48%" alt="Finishing-position heat map and what-if scenario">
+</p>
 
-Projekt jest podzielony na niezalezne moduly:
+> These samples were generated before the final retraining run
+> (see "Engineering notes" below), so the numbers are illustrative.
+> The report text is in Polish; the codebase and docs are in English.
 
-- `football_ai/config` - konfiguracja aplikacji i aliasy nazw druzyn
-- `football_ai/database` - schemat SQL, ORM SQLAlchemy, sesje i repozytoria
-- `football_ai/scrapers` - konektory do StatsBomb, Football-Data, Elo, Open-Meteo, FBref i Kaggle
-- `football_ai/data` - ladowanie danych, czyszczenie i normalizacja
-- `football_ai/features` - generowanie cech meczowych, druzynowych i H2H
-- `football_ai/models` - osobne implementacje modeli oraz ensemble
-- `football_ai/training` - walidacja czasowa, tuning Optuna i orkiestracja treningu
-- `football_ai/evaluation` - metryki, wykresy, SHAP i raporty
-- `football_ai/predictions` - serwis inferencyjny i schematy odpowiedzi
-- `football_ai/api` - REST API w FastAPI
-- `football_ai/notebooks` - notebooki analityczne
-- `football_ai/tests` - testy jednostkowe i integracyjne
+## What is in here
 
-## Repozytorium GitHub
+| Layer | Package | Notes |
+|---|---|---|
+| Data collection | `football_ai/scrapers` | martj42 results (1872-present), Elo ratings, StatsBomb open data, Football-Data, Open-Meteo, tournament squads (footballcsv/footballsquads) |
+| Data quality | `football_ai/data_quality` | integrity validators, coverage report, per-record provenance and license-status checks |
+| Features | `football_ai/features` | leak-safe rolling / recency / head-to-head features, Elo, squad indices (age, height, continuity, club cohesion) |
+| Models | `football_ai/models` | Random Forest, LightGBM, CatBoost, XGBoost, stacking ensemble, joblib artifacts and a model registry |
+| Training | `football_ai/training` | chronological splits, Optuna tuning with rolling CV, probability calibration |
+| Inference | `football_ai/predictions`, `football_ai/api` | feature builder shared with training, FastAPI service |
+| Simulation | `football_ai/simulation` | Poisson-scoreline Monte Carlo, group tables, what-if scenarios |
+| Facts | `football_ai/insights` | streaks, records, head-to-head, each fact carries the list of matches it was derived from |
+| Narrative | `football_ai/narrative` | deterministic templates (no LLM-generated facts) |
+| App | `football_ai/streamlit_app.py` | match preview, group outlook, PDF export |
 
-Docelowe repozytorium projektu:
+## Engineering notes
 
-- [franektrafas/betclic.v1](https://github.com/franektrafas/betclic.v1.git)
+**No random splits, anywhere.** All splitting lives in
+`training/splitters.py` (a single chronological 70/15/15 cut and rolling
+positional folds). Optuna's objective and the stacking ensemble both build
+their `cv=` from those splitters, since scikit-learn's default
+(Stratified)KFold would silently reintroduce time-series leakage.
 
-Lokalne repo zostalo juz przygotowane pod branch `main` i zdalny `origin`.
+**Leakage audits with regression tests.** Several real leaks were found and
+fixed by auditing the feature set, each pinned by a test:
 
-## Tryb pracy: lokalnie + Colab
+- the current match's own score and cards reaching the feature set
+- a same-name merge collision that leaked post-match stats
+  (`_wide_merge` now drops engineered columns that shadow source columns)
+- a home/away label leak on neutral ground: rolling features now treat both
+  teams as "away" at neutral venues, and the raw `is_home` flag and
+  `home_team_name`/`away_team_name` categoricals were removed from the
+  features. A full-pipeline test asserts that relabelling home and away on a
+  neutral-venue match yields mirrored feature rows.
 
-Projekt jest przygotowany pod workflow hybrydowy:
+**Run-to-run variance matters.** While verifying the neutral-ground fix, the
+same training command on the same data gave opposite verdicts on one
+fixture, traced to an unseeded Optuna sampler combined with too few trials on
+a rare region of the data (large Elo gap on neutral ground). The lesson
+recorded in the repo: do not pick a model because one run looked good.
 
-- lokalnie: edycja kodu, lekkie testy, API, czyszczenie danych, przeglad wynikow
-- Google Colab: feature engineering na wiekszych zbiorach, tuning Optuna, trening LightGBM, CatBoost, XGBoost i ensemble
+**Honest about data rights.** Sources whose terms forbid ML use (for example
+ESPN) are marked `FORBIDDEN` in the provenance layer. The corresponding match
+statistics (corners, cards, shots, possession) are withdrawn rather than
+predicted from data the project may not use, and the UI says so instead of
+showing invented numbers.
 
-Jesli komputer lokalny jest slabszy, nie trzeba na nim trenowac modeli. Wystarczy:
+**Training and serving share one feature code path.** The inference builder
+re-runs `build_features` on history plus the single upcoming match, and the
+serving layer logs a warning on any feature-schema drift against the trained
+artifact.
 
-- rozwijac kod lokalnie
-- commitowac i pushowac zmiany do GitHub
-- uruchamiac notebooki treningowe w Colabie
+The full engine plan and the history of decisions are in
+[`docs/archive/ENGINE_PLAN.md`](docs/archive/ENGINE_PLAN.md).
 
-## Szybki start lokalny
+## Quick start
 
-Do lekkiej pracy lokalnej uzyj minimalnych zaleznosci:
-
-```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements-local.txt
-```
-
-To wystarcza do:
-
-- pracy z kodem
-- uruchamiania API
-- lekkich testow
-- przygotowania danych i struktury projektu
-
-## Szybki start Colab
-
-Do treningu i tuningu uzyj pelnego zestawu zaleznosci:
-
-```bash
-pip install -r requirements-colab.txt
-```
-
-W repo znajduje sie notebook startowy:
-
-- `football_ai/notebooks/00_colab_bootstrap.ipynb`
-
-Notebook:
-
-- montuje Google Drive
-- klonuje lub aktualizuje repo
-- instaluje zaleznosci treningowe
-- przygotowuje plik `.env` pod artefakty modeli na Google Drive
-
-Poniewaz repo jest prywatne, bootstrap Colaba zaklada logowanie tokenem GitHub tylko do odczytu repozytorium.
-
-Najlepsza opcja:
-
-- utworz Fine-grained Personal Access Token
-- nadaj mu dostep `Contents: Read-only`
-- ogranicz go tylko do repo `franektrafas/betclic.v1`
-- nie wklejaj tokenu do czatu ani do plikow repo
-
-## Pelny setup developerski
+Python 3.12 is required.
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
-pip install --upgrade pip
 pip install -r requirements.txt
-```
+cp .env.example .env            # only needed for the optional live-fixtures source
 
-2. Skopiuj konfiguracje:
-
-```bash
-cp .env.example .env
-```
-
-3. Uruchom PostgreSQL i zaloz baze:
-
-```bash
-createdb football_ai
-```
-
-4. Utworz tabele:
-
-```bash
-python -m football_ai.database.session
-```
-
-5. Pobierz dane:
-
-```bash
-python -m football_ai.scrapers.sources.statsbomb
-python -m football_ai.scrapers.sources.football_data
+python -m football_ai.scrapers.sources.international_results   # match history
 python -m football_ai.scrapers.sources.elo
-python -m football_ai.scrapers.sources.open_meteo
-python -m football_ai.scrapers.sources.fbref
+python -m football_ai.training.orchestrator --targets match_outcome,home_goals,away_goals --n-trials 20
+uvicorn football_ai.api.main:app --reload                      # GET /health, POST /predict
+streamlit run football_ai/streamlit_app.py
 ```
 
-6. Zbuduj cechy i uruchom trening:
+`requirements-local.txt` is a lighter set for code, API and test work without
+training dependencies.
 
-```bash
-python -m football_ai.training.orchestrator
-```
-
-7. Uruchom API:
-
-```bash
-uvicorn football_ai.api.main:app --reload
-```
-
-## Wsparcie dla Google Colab
-
-Kod zostal przygotowany modulowo, dzieki czemu notebooki w `football_ai/notebooks` moga importowac logike bez kopiowania kodu. W Colabie nalezy:
-
-- uruchomic `football_ai/notebooks/00_colab_bootstrap.ipynb`
-- zainstalowac zaleznosci z `requirements-colab.txt`
-- zamontowac repozytorium z GitHub
-- ustawic zmienne srodowiskowe z `.env`
-- skierowac `MODEL_ARTIFACT_DIR` na Google Drive
-
-Jesli repo na GitHub jest prywatne, Colab bedzie potrzebowal tokenu GitHub. Notebook `00_colab_bootstrap.ipynb` prosi o token przez ukryty prompt i nie zapisuje go do repozytorium.
-
-## Baza danych
-
-Schemat relacyjny znajduje sie w `football_ai/database/sql/schema.sql`, a mapowanie ORM w `football_ai/database/models.py`.
-
-Kluczowe tabele:
-
-- `matches`
-- `teams`
-- `players`
-- `lineups`
-- `team_statistics`
-- `player_statistics`
-- `elo_ratings`
-- `injuries`
-- `weather`
-- `predictions`
-- `model_versions`
-
-## Zrodla danych
-
-- StatsBomb Open Data
-- Football-Data.co.uk
-- Football API (API-Sports)
-- World Football Elo Ratings
-- Open-Meteo
-- FBref
-- pliki od uzytkownika z Kaggle
-
-## Test Football API
-
-Po uzupelnieniu `.env` o `FOOTBALL_API_KEY` mozna sprawdzic integracje live:
-
-```bash
-python3 -m football_ai.scrapers.sources.football_api --date 2026-07-10 --next-count 10
-```
-
-Przyklad dla konkretnej druzyny lub rozgrywek:
-
-```bash
-python3 -m football_ai.scrapers.sources.football_api --date 2026-07-10 --team-id 1095
-python3 -m football_ai.scrapers.sources.football_api --date 2026-07-10 --league-id 4 --season 2026
-```
-
-Wynik zostanie:
-
-- wyswietlony w terminalu
-- zapisany jako raw JSON w `football_ai/data/raw/football_api`
-- znormalizowany do kolumn zgodnych z naszym pipeline
-
-## Trening modeli
-
-Za trening odpowiada zestaw modeli:
-
-- Logistic Regression
-- Random Forest
-- LightGBM
-- CatBoost
-- XGBoost
-- Stacking Ensemble
-
-Kazdy model posiada:
-
-- osobny plik
-- osobny pipeline
-- zapis `joblib`
-- wczytywanie
-- predykcje
-
-## Walidacja i ewaluacja
-
-Projekt stosuje:
-
-- podzial chronologiczny `train/validation/test`
-- `TimeSeriesSplit` dla walidacji podczas tuningu
-- metryki klasyfikacyjne i regresyjne
-- kalibracje, ROC, PR, confusion matrix
-- feature importance i SHAP
-
-## Testy
+## Tests
 
 ```bash
 python -m unittest discover football_ai/tests
 ```
 
-## CI
+Some tests are skipped when optional heavy dependencies (joblib, scikit-learn,
+FastAPI, pydantic, SQLAlchemy, Streamlit) are not installed; a skip is not a
+pass.
 
-Workflow GitHub Actions uruchamia:
+## Status
 
-- instalacje zaleznosci
-- testy jednostkowe
-- podstawowa weryfikacje importow
-- harmonogram odswiezania danych do uruchamiania po skonfigurowaniu sekretow i danych wejsciowych
-
-## Co bedzie potrzebne pozniej od Ciebie
-
-Na obecnym etapie nie musisz jeszcze nic dosylac poza repo. W kolejnych krokach przydadza sie:
-
-- pobrane pliki z Kaggle
-- eksporty FBref, jesli chcesz ich uzywac jako lokalnego wsadu
-- decyzja, gdzie na Google Drive mamy trzymac modele, dane i raporty
-- dane dostepowe do PostgreSQL, jesli baza ma dzialac poza lokalnym srodowiskiem i CI
-
-## Dalszy rozwoj
-
-Architektura zostala przygotowana tak, aby mozna bylo:
-
-- dodawac nowe zrodla danych bez przepisywania pipeline'u
-- trenowac wiele targetow w ramach wspolnego rejestru modeli
-- podpinac nowsze modele i dodatkowe strategie ensemble
-- rozszerzac API o batch scoring i wersjonowanie predykcji
+Personal portfolio project. The prediction engine and the layers above it are
+implemented; the retraining of the final models after the leakage fixes is the
+last open item, so no headline accuracy figures are published here yet.
+Earlier plans for a commercial API are archived in `docs/archive/`.
